@@ -12,7 +12,7 @@ from jinja2 import Template
 import numpy as np
 from PIL import Image
 
-from .engine import NULL_BINS, NULL_MAX
+from .engine import DISPLAY_FACTOR, NULL_BINS, NULL_MAX
 from .stats import chi2_threshold, decode, exceedance
 
 DECREASE = "#ff3b30"
@@ -69,12 +69,21 @@ def overlay_png(result, alpha):
     rgba = np.zeros(inc.shape + (4,), dtype=np.uint8)
     rgba[dec] = _hex_rgb(DECREASE) + (255,)
     rgba[inc] = _hex_rgb(INCREASE) + (255,)
+    return _png(Image.fromarray(rgba, "RGBA"))
+
+
+def _png(image):
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=6)
+    image.save(buf, format="PNG", compress_level=6)
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def build_map(result, alpha, layers=None):
+def backscatter_png(db):
+    """Greyscale PNG of a stored uint8 backscatter layer; no data transparent."""
+    return _png(Image.fromarray(np.dstack([db, db, db, np.where(db > 0, 255, 0).astype(np.uint8)]), "RGBA"))
+
+
+def build_map(result, alpha):
     p = result.params
     (south, west), (north, east) = result.grid.latlon_bounds()
     m = folium.Map(location=[(south + north) / 2, (west + east) / 2], zoom_start=11,
@@ -84,13 +93,19 @@ def build_map(result, alpha, layers=None):
         attr="Esri World Imagery", name="Satellite photo (Esri)",
     ).add_to(m)
     folium.TileLayer("OpenStreetMap", name="Street map", show=False).add_to(m)
-    for name, url in (layers or {}).items():
-        folium.TileLayer(url, attr="Google Earth Engine, Copernicus Sentinel-1",
-                         name=f"{name}: radar VV (dB)", overlay=True, show=False).add_to(m)
+    for name, db in (("Before", result.before_db), ("After", result.after_db)):
+        if db is not None:
+            f = DISPLAY_FACTOR
+            folium.raster_layers.ImageOverlay(
+                backscatter_png(db), bounds=result.grid.window_latlon(0, 0, db.shape[1] * f, db.shape[0] * f),
+                name=f"{name}: radar image (VV)", show=False,
+                attr="Contains modified Copernicus Sentinel data",
+            ).add_to(m)
 
     folium.raster_layers.ImageOverlay(
         overlay_png(result, alpha), bounds=[[south, west], [north, east]],
         name=f"Significant change (α = {alpha:g})",
+        attr="Contains modified Copernicus Sentinel data (via Microsoft Planetary Computer)",
     ).add_to(m)
     w, s, e, n = p.bounds
     folium.Rectangle([[s, w], [n, e]], name="Area analysed", fill=False,

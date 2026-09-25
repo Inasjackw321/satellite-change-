@@ -1,16 +1,9 @@
 import numpy as np
 import pytest
 
-from satchange.stats import (
-    LRT_EXPRESSION, NODATA, NOMINAL_ENL, chi2_threshold, decode, estimate_enl, exceedance,
-)
+from satchange.stats import NODATA, NOMINAL_ENL, chi2_threshold, decode, estimate_enl, exceedance, lrt
 
 N = 400_000
-
-
-def lrt(s1, s2, L1, L2):
-    """Evaluate the same expression string Earth Engine uses."""
-    return eval(LRT_EXPRESSION, {"log": np.log}, {"s1": s1, "s2": s2, "L1": L1, "L2": L2})
 
 
 def speckle(rng, mean, looks, n=N):

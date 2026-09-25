@@ -5,11 +5,10 @@ import math
 
 import requests
 
-from .engine import Grid
+from .engine import MAX_PIXELS, Grid
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 USER_AGENT = "satellite-change-map/1.0 (https://github.com/Inasjackw321/satellite-change-)"
-MAX_PIXELS = 80e6  # ~8,000 km2 at 10 m
 MIN_SIDE_KM = 4.0
 
 

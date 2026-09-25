@@ -23,28 +23,32 @@ test is Bartlett's test for equal variances (a gamma variable with L looks is
 a scaled chi-square with 2L dof), so we divide by Bartlett's correction
 factor, which brings the false alarm rate back to ``alpha``.
 
-The statistic is written once as an expression string so that Earth Engine
-(``ee.Image.expression``) and NumPy (in the tests) evaluate exactly the
-same formula.
+Everything is computed locally with NumPy at full 10 m resolution.
 """
 
 import numpy as np
 from scipy import optimize, stats
 
 # ESA's nominal equivalent number of looks for Sentinel-1 IW GRDH products.
-# Earth Engine's terrain-corrected product can differ; see estimate_enl.
+# Terrain-corrected products can differ; see estimate_enl.
 NOMINAL_ENL = 4.4
 
-# Bartlett-corrected -2 log Q for a single band. s1, s2 are mean intensities
-# (linear power, not dB) and L1, L2 their numbers of looks. Under H0 the
-# common mean is the looks-weighted average of s1 and s2.
-LRT_EXPRESSION = (
-    "2 * ((L1 + L2) * log((L1 * s1 + L2 * s2) / (L1 + L2))"
-    " - L1 * log(s1) - L2 * log(s2))"
-    " / (1 + (1 / L1 + 1 / L2 - 1 / (L1 + L2)) / 6)"
-)
 
-# The statistic is downloaded as int16: round(stat * STAT_SCALE), signed by
+def lrt(s1, s2, L1, L2):
+    """Bartlett-corrected -2 log Q for one band.
+
+    s1, s2 are mean intensities (linear power, not dB) and L1, L2 their
+    numbers of looks. Under H0 the common mean is the looks-weighted average
+    of s1 and s2. Works on scalars and arrays.
+    """
+    s1, s2, L1, L2 = (np.asarray(v, dtype=np.float64) for v in (s1, s2, L1, L2))
+    pooled = (L1 * s1 + L2 * s2) / (L1 + L2)
+    m2logq = 2 * ((L1 + L2) * np.log(pooled) - L1 * np.log(s1) - L2 * np.log(s2))
+    bartlett = 1 + (1 / L1 + 1 / L2 - 1 / (L1 + L2)) / 6
+    return np.maximum(m2logq / bartlett, 0)
+
+
+# The statistic is stored as int16: round(stat * STAT_SCALE), signed by
 # the direction of change (+ increase, - decrease). Values are capped at
 # STAT_MAX, far beyond any useful threshold (chi2 at alpha=1e-6, 2 dof ~ 27.6).
 STAT_SCALE = 100
@@ -97,7 +101,7 @@ def estimate_enl(log_ratios, bounds=(0.5, 200.0)):
 
 
 def decode(signed):
-    """Split the downloaded int16 array into (statistic, increased, valid)."""
+    """Split the stored int16 array into (statistic, increased, valid)."""
     valid = signed != NODATA
     stat = np.abs(signed.astype(np.float32)) / STAT_SCALE
     return stat, signed > 0, valid

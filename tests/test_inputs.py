@@ -1,66 +1,16 @@
 import datetime as dt
-import json
 
 import pytest
 
-from satchange import account, engine, inputs
-
-
-# --- Sign out ---------------------------------------------------------------
-
-@pytest.fixture
-def credentials(monkeypatch, tmp_path):
-    path = tmp_path / "credentials"
-    path.write_text(json.dumps({"refresh_token": "secret-token"}))
-    monkeypatch.setattr(account, "credentials_path", lambda: str(path))
-    return path
-
-
-def test_sign_out_revokes_token_and_deletes_credentials(credentials, monkeypatch):
-    posted = []
-    monkeypatch.setattr(account.requests, "post", lambda url, **kw: posted.append((url, kw)))
-    assert account.is_signed_in()
-    account.sign_out()
-    assert not account.is_signed_in() and not credentials.exists()
-    assert posted == [(account.REVOKE_URL, {"params": {"token": "secret-token"}, "timeout": 10})]
-
-
-def test_sign_out_still_signs_out_when_offline(credentials, monkeypatch):
-    def fail(*a, **kw):
-        raise account.requests.ConnectionError("offline")
-    monkeypatch.setattr(account.requests, "post", fail)
-    account.sign_out()
-    assert not credentials.exists()
-
-
-def test_sign_out_when_already_signed_out(credentials):
-    credentials.unlink()
-    account.sign_out()  # no error
-
-
-def test_connect_requires_sign_in(credentials):
-    credentials.unlink()
-    with pytest.raises(account.NotSignedIn):
-        account.connect("p")
-
-
-@pytest.mark.parametrize("message,expected", [
-    ("Not signed up for Earth Engine or project is not registered.", "isn't registered"),
-    ("Earth Engine API has not been used in project 123 before or it is disabled.", "switched off"),
-    ("Caller does not have required permission to use project p.", "doesn't have access"),
-    ("invalid_grant: Token has been expired or revoked.", "sign-in has expired"),
-    ("Too many concurrent aggregations.", "busy"),
-    ("Something unusual", "Something unusual"),
-])
-def test_explain_error(message, expected):
-    assert expected in account.explain_error(Exception(message), "p")
+from satchange import engine, inputs
 
 
 # --- Inputs -----------------------------------------------------------------
 
 def test_fit_area_keeps_normal_city():
-    bounds, note = inputs.fit_area(engine.CITIES["Kyiv"])
-    assert bounds == pytest.approx(engine.CITIES["Kyiv"]) and note is None
+    kyiv = engine.CITIES["Kyiv – whole city (large download)"]
+    bounds, note = inputs.fit_area(kyiv)
+    assert bounds == pytest.approx(kyiv) and note is None
 
 
 def test_fit_area_enlarges_a_point():
@@ -72,7 +22,7 @@ def test_fit_area_enlarges_a_point():
 def test_fit_area_trims_huge_area_to_limit():
     bounds, note = inputs.fit_area((22.0, 44.0, 40.0, 52.0))  # most of Ukraine
     g = engine.Grid.for_bounds(bounds)
-    assert g.width * g.height <= inputs.MAX_PIXELS and "trimmed" in note
+    assert g.pixels <= engine.MAX_PIXELS and "trimmed" in note
     assert (bounds[0] + bounds[2]) / 2 == pytest.approx(31.0)
 
 

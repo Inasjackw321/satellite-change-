@@ -4,7 +4,8 @@ import numpy as np
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from satchange import account, engine, stats
+from satchange import engine, source, stats
+from tests import conftest
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -24,115 +25,121 @@ def synthetic_result():
                          enl=4.8, enl_estimated=True, null_hist=hist, orbits=[])
 
 
-class FakeAccount:
-    def __init__(self, signed_in):
-        self.signed_in = signed_in
-        self.sign_ins = self.sign_outs = 0
-
-    def install(self, monkeypatch):
-        monkeypatch.setattr(account, "is_signed_in", lambda: self.signed_in)
-        monkeypatch.setattr(account, "list_projects", lambda: ["alpha-project", "beta-project"])
-        monkeypatch.setattr(account, "start_sign_in", self.start_sign_in)
-        monkeypatch.setattr(account, "sign_out", self.sign_out)
-        monkeypatch.setattr(account, "connect", self.connect)
-
-    def start_sign_in(self):
-        self.sign_ins += 1
-        self.signed_in = True  # as if the browser flow finished instantly
-
-    def sign_out(self):
-        self.sign_outs += 1
-        self.signed_in = False
-
-    def connect(self, project):
-        raise RuntimeError("offline in tests")
+_ARCHIVE = []
 
 
-def make_app(monkeypatch, tmp_path, signed_in):
-    fake = FakeAccount(signed_in)
-    fake.install(monkeypatch)
-    monkeypatch.setattr(engine, "CACHE_DIR", tmp_path)
+def app_archive():
+    return _ARCHIVE[0]
+
+
+@pytest.fixture
+def app(offline, monkeypatch, tmp_path):
+    _ARCHIVE[:] = [offline]
+    import streamlit as st
+    st.cache_data.clear()
     monkeypatch.setenv("SATCHANGE_CONFIG", str(tmp_path / "config.json"))
-    at = AppTest.from_file(APP, default_timeout=30)
-    return at, fake
+    return AppTest.from_file(APP, default_timeout=60)
 
 
 def button(at, label):
     return next(b for b in at.button if b.label == label)
 
 
-def test_signed_out_first_open(monkeypatch, tmp_path):
-    at, _ = make_app(monkeypatch, tmp_path, signed_in=False)
+def choose_test_area(at):
+    at.sidebar.selectbox[0].set_value("Enter coordinates…").run()
+    w, s, e, n = conftest.AOI
+    for label, v in (("West", w), ("East", e), ("South", s), ("North", n)):
+        next(x for x in at.sidebar.number_input if x.label.startswith(label)).set_value(v)
     at.run()
-    assert not at.exception
-    assert button(at, "Find changes").disabled
-    assert any("Sign in with your Google account" in m.value for m in at.markdown)
 
 
-def test_sign_in_then_out(monkeypatch, tmp_path):
-    at, fake = make_app(monkeypatch, tmp_path, signed_in=False)
-    at.run()
-    button(at, "Sign in with Google").click().run()
-    at.run()
-    assert not at.exception and fake.sign_ins == 1
-    assert any("Signed in" in m.value for m in at.sidebar.markdown)
-    # Projects are offered in a dropdown once signed in.
-    assert at.sidebar.selectbox[0].options[:2] == ["alpha-project", "beta-project"]
-    assert not button(at, "Find changes").disabled
-
-    button(at, "Sign out").click().run()
-    assert any("Sign out of Google Earth Engine" in w.value for w in at.sidebar.warning)
-    button(at, "Yes, sign out").click().run()
-    assert fake.sign_outs == 1
-    assert any(b.label == "Sign in with Google" for b in at.button)
-    assert button(at, "Find changes").disabled
+def test_first_open_needs_no_account(app):
+    app.run()
+    assert not app.exception
+    labels = [b.label for b in app.button]
+    assert "Find changes" in labels and not any("Sign" in l for l in labels)
+    info = " ".join(i.value for i in app.sidebar.info)
+    assert "Found **4 before** and **4 after** images" in info and "Download: about" in info
+    assert not button(app, "Find changes").disabled
 
 
-def test_cancel_sign_out(monkeypatch, tmp_path):
-    at, fake = make_app(monkeypatch, tmp_path, signed_in=True)
-    at.run()
-    button(at, "Sign out").click().run()
-    button(at, "Cancel").click().run()
-    assert fake.sign_outs == 0 and not at.sidebar.warning
+def test_find_changes_end_to_end(app):
+    app.run()
+    choose_test_area(app)
+    button(app, "Find changes").click().run()
+    assert not app.exception and not app.error
+    assert "My area" in app.header[0].value
+    metrics = {m.label: m.value for m in app.metric}
+    patch = float(metrics["Radar signal decreased"].split()[0])
+    assert 0.4 < patch < 0.8  # the ~0.55 km2 patch plus chance hits
+    assert metrics["No-change check"].endswith("flagged")
+    # Now saved: it reopens instantly, even offline.
+    assert any("Already computed" in i.value for i in app.sidebar.info)
+    source_search = source.search
+    try:
+        source.search = lambda *a, **k: pytest.fail("should not go online")
+        app.run()
+        assert not app.exception and not app.sidebar.error
+        assert not button(app, "Find changes").disabled
+    finally:
+        source.search = source_search
 
 
-def test_connection_error_is_explained(monkeypatch, tmp_path):
-    at, fake = make_app(monkeypatch, tmp_path, signed_in=True)
-    monkeypatch.setattr(account, "connect", lambda p: (_ for _ in ()).throw(
-        Exception("Not signed up for Earth Engine or project is not registered.")))
-    at.run()
-    button(at, "Find changes").click().run()
-    assert any("isn't registered" in e.value for e in at.error)
+def test_area_without_images_is_explained(app, monkeypatch):
+    far_away = [source.Scene(**{**s.__dict__, "geometry": {
+        "type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}})
+        for s in conftest.Archive.search(app_archive(), None, "2021-01-01", "2023-01-01")]
+    monkeypatch.setattr(source, "search", lambda b, start, end, session=None: [
+        s for s in far_away if str(start) <= str(s.day) < str(end)])
+    app.run()
+    choose_test_area(app)
+    button(app, "Find changes").click().run()
+    assert any("don't cover this area" in e.value for e in app.error)
+    assert "Radar change map" in app.header[0].value  # no empty result shown
 
 
-def test_simple_dates_show_both_periods(monkeypatch, tmp_path):
-    at, _ = make_app(monkeypatch, tmp_path, signed_in=True)
-    at.run()
-    text = " ".join(c.value for c in at.sidebar.caption)
+def test_archive_problems_are_shown(app, monkeypatch):
+    def unreachable(*a, **k):
+        raise source.SourceError("Can't reach Microsoft Planetary Computer. Check your internet connection.")
+    monkeypatch.setattr(source, "search", unreachable)
+    app.run()
+    assert any("Can't reach Microsoft Planetary Computer" in e.value for e in app.sidebar.error)
+    assert button(app, "Find changes").disabled
+
+
+def test_dates_in_wrong_order_are_explained(app):
+    app.run()
+    app.sidebar.toggle[0].set_value(True).run()
+    app.sidebar.date_input[0].set_value(("2022-04-01", "2022-05-01")).run()
+    assert any("before period must end before" in e.value for e in app.sidebar.error)
+
+
+def test_simple_dates_show_both_periods(app):
+    app.run()
+    text = " ".join(c.value for c in app.sidebar.caption)
     assert "01 Apr 2021 – 26 May 2021" in text and "01 Apr 2022 – 26 May 2022" in text
 
 
-def test_result_view_updates_with_alpha(monkeypatch, tmp_path):
-    at, _ = make_app(monkeypatch, tmp_path, signed_in=True)
-    at.session_state["result"] = synthetic_result()
-    at.session_state["layers"] = {}
-    at.run()
-    assert not at.exception
-    metrics = {m.label: m.value for m in at.metric}
+def test_result_view_updates_with_alpha(app):
+    app.session_state["result"] = synthetic_result()
+    app.run()
+    assert not app.exception
+    metrics = {m.label: m.value for m in app.metric}
     assert float(metrics["Radar signal decreased"].split()[0]) > 0.04
 
-    at.select_slider[0].set_value(1e-6)
-    at.run()
-    metrics = {m.label: m.value for m in at.metric}
+    app.select_slider[0].set_value(1e-6)
+    app.run()
+    metrics = {m.label: m.value for m in app.metric}
     # At alpha = 1e-6 essentially only the 0.04 km2 block remains.
     assert float(metrics["Radar signal decreased"].split()[0]) == pytest.approx(0.04, abs=0.002)
     assert metrics["No-change check"].startswith("0.00")
 
 
-def test_saved_maps_can_be_reopened(monkeypatch, tmp_path):
-    at, _ = make_app(monkeypatch, tmp_path, signed_in=True)
-    synthetic_result().save(tmp_path / "saved.npz")
-    at.run()
-    button(at, "Open").click().run()
-    assert not at.exception
-    assert "Testville" in at.header[0].value
+def test_saved_maps_can_be_reopened_and_deleted(app, tmp_path):
+    engine.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    synthetic_result().save(engine.CACHE_DIR / "saved.npz")
+    app.run()
+    button(app, "Open").click().run()
+    assert not app.exception and "Testville" in app.header[0].value
+    button(app, "Delete all").click().run()
+    assert engine.saved_results() == [] and "Radar change map" in app.header[0].value
