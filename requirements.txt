@@ -6,4 +6,4 @@ shapely>=2.0
 folium>=0.15
 streamlit>=1.64
 streamlit-folium>=0.25
-pillow>=10
+pillow>=10.1

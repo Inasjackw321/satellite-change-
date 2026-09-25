@@ -87,8 +87,8 @@ def test_find_changes_end_to_end(app):
     assert "My area: 4 Jul 2026 → 4 Aug 2026" in app.header[0].value
     metrics = {m.label: m.value for m in app.metric}
     assert 0.45 < float(metrics["Radar signal decreased"].split()[0]) < 0.65  # the ~0.55 km2 patch
-    assert metrics["Radar signal increased"] == "0.00 km²"
-    assert metrics["Changed spots"] == "1" and metrics["Noise check"] == "0.00 km²"
+    assert 0.10 < float(metrics["Radar signal increased"].split()[0]) < 0.18  # the "aircraft" patch
+    assert metrics["Changed spots"] == "2" and metrics["Noise check"] == "0.00 km²"
     # Now saved: it reopens instantly, even offline.
     assert any("Already computed" in i.value for i in app.sidebar.info)
     source_search = source.search
@@ -210,3 +210,20 @@ def test_drawn_box_is_remembered_next_time(app, monkeypatch, tmp_path):
     fresh.run()
     fresh.sidebar.selectbox[0].set_value("Drawn on the map").run()
     assert any("About 19 km²" in c.value for c in fresh.sidebar.caption)
+
+
+def test_download_box_makes_a_watermarked_image(app):
+    app.run()
+    choose_test_area(app)
+    button(app, "Find changes").click().run()
+    assert app.text_input(key="export_watermark").value == "@Kaldockhi"
+    app.radio(key="export_background").set_value("Radar image").run()  # no internet in tests
+    button(app, "Create image").click().run()
+    assert not app.exception and not app.warning
+    labels = [b.label for b in app.get("download_button")]
+    assert "Download image (PNG)" in labels
+    assert "List of changed spots (CSV)" in labels and "Interactive map (HTML)" in labels
+
+    # Changing a setting asks for a new image.
+    app.text_input(key="export_watermark").set_value("@someone").run()
+    assert any("press **Create image** again" in c.value for c in app.caption)

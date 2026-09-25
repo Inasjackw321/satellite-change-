@@ -59,6 +59,19 @@ On the change map, **Detection** sets what counts as a change:
 
 Changing it updates the map instantly.
 
+**Numbers on the map:** each detected spot has a number next to it: how many
+times the satellite saw a change there between one pass and the next, across
+all the images downloaded. A building destroyed once shows **1**; aircraft or
+vehicles that came, left and came back show **3**. Hover over the number for
+the size of the change and the dates.
+
+**Download:** the box under the map makes a finished picture (PNG or JPEG) of
+the changes over a satellite photo or the radar image. It includes the numbers,
+a legend (place, dates, colours, what the numbers mean, detection setting,
+scale bar, credits), a north arrow and a watermark (**@Kaldockhi** by default,
+editable). You can also download the interactive map (HTML) and a list of every
+changed spot (CSV: location, size, change in dB, times changed, dates).
+
 ### Where the images come from
 
 [Microsoft Planetary Computer](https://planetarycomputer.microsoft.com/dataset/sentinel-1-rtc)
@@ -134,11 +147,16 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
   image windows.
 - `satchange/engine.py`: orbit choice, download planning, the tiled
   computation, the no-change check, and the cache.
-- `satchange/render.py`: the detection filters, areas and the Leaflet map.
+- `satchange/render.py`: the detection filters, spots and their history, areas
+  and the Leaflet map.
+- `satchange/export.py`: the downloadable image (background, numbers, legend,
+  watermark) and the spot list.
 - `satchange/inputs.py`: place search, area fitting, drawn boxes.
 - `app.py`: the Streamlit UI. `launch.py`: the launcher.
 - `tests/`: Monte Carlo checks of the statistics; the whole pipeline on
   synthetic Sentinel-1 GeoTIFFs with known speckle and a known changed patch
-  (checks the dates chosen, detection and its location, change size, the
-  false-alarm rate, ENL and the noise check);
+  and a patch that "comes and goes" like parked aircraft (checks the dates
+  chosen, detection and its location, change size, how many times each spot
+  changed and when, the false-alarm rate, ENL and the noise check); the
+  exported image (legend, watermark, numbers, satellite tiles lining up);
   and UI tests.

@@ -13,7 +13,7 @@ from branca.element import MacroElement
 from folium.plugins import Draw
 from jinja2 import Template
 
-from satchange import engine, inputs, render, source
+from satchange import engine, export, inputs, render, source
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("SATCHANGE_CONFIG", ROOT / "config.json"))
@@ -24,6 +24,7 @@ SEARCH, DRAWN, COORDS = "Search for a place…", "Drawn on the map", "Enter coor
 CHOOSE, RESULT = "✏️ Choose area", "🗺️ Change map"
 SATELLITE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 BIG_DOWNLOAD_MB = 500
+DEFAULT_WATERMARK = "@Kaldockhi"
 
 st.set_page_config(page_title="Satellite Change Map", page_icon="🛰️", layout="wide")
 ss = st.session_state
@@ -70,6 +71,11 @@ def find_images(key, _params):
 @st.cache_data(show_spinner="Drawing map…", max_entries=8)
 def map_html(key, det, _result):
     return render.build_map(_result, render.Detection(*det)).get_root().render()
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def spot_list(key, det, _result):
+    return export.spots_csv(_result, render.Detection(*det))
 
 
 def describe(det):
@@ -358,14 +364,48 @@ else:
 
     html = map_html(p.cache_key(), (det.alpha, det.min_db, det.min_area_m2), result)
     st.iframe(html, height=680)
-    st.caption("Red: radar signal decreased · Cyan: increased · Use the layer menu (top right) "
-               "to see the before and after radar images. A change in radar signal means "
-               "something changed on the ground, not necessarily damage.")
+    st.caption("Red: radar signal decreased · Cyan: increased · The number next to each spot is "
+               "how many times the satellite saw a change there between one pass and the next; "
+               "hover over it for the dates. Use the layer menu (top right) for the before and "
+               "after radar images. A change in radar signal means something changed on the "
+               "ground, not necessarily damage.")
 
-    c1, _ = st.columns([1, 3])
-    c1.download_button("Download map (HTML)", html,
-                       file_name=f"{p.label.lower().replace(' ', '_')}_{p.start}_{p.end}.html",
-                       mime="text/html", use_container_width=True)
+    with st.container(border=True):
+        st.markdown("#### ⬇️ Download")
+        c1, c2, c3, c4 = st.columns([1.4, 1.2, 0.8, 0.8], vertical_alignment="bottom")
+        background = c1.radio("Background", ["Satellite photo", "Radar image"], horizontal=True,
+                              key="export_background")
+        watermark = c2.text_input("Watermark", cfg.get("watermark", DEFAULT_WATERMARK), key="export_watermark")
+        numbers = c3.checkbox("Numbers", True, key="export_numbers",
+                              help="Show how many times a change was seen next to each spot.")
+        fmt = c4.selectbox("Format", ["PNG", "JPEG"], key="export_format")
+        settings = (p.cache_key(), det, background, watermark, numbers, fmt)
+        if st.button("Create image", type="primary"):
+            with st.spinner("Creating image…"):
+                data, note = export.export_image(
+                    result, det, preset, "satellite" if background == "Satellite photo" else "radar",
+                    watermark, numbers, fmt)
+            ss.export = (settings, data, note)
+            save_config(watermark=watermark)
+        made = ss.get("export")
+        name = f"{p.label.lower().replace(' ', '_')}_{p.start}_{p.end}"
+        if made and made[0] == settings:
+            _, data, note = made
+            if note:
+                st.warning(note)
+            st.image(data, width=560)
+            st.download_button(f"Download image ({fmt})", data, file_name=f"{name}.{fmt.lower()}",
+                               mime=f"image/{fmt.lower()}", type="primary")
+        elif made:
+            st.caption("Settings changed: press **Create image** again.")
+
+        c1, c2, _ = st.columns([1, 1, 1])
+        c1.download_button("Interactive map (HTML)", html, file_name=f"{name}.html", mime="text/html",
+                           use_container_width=True)
+        c2.download_button("List of changed spots (CSV)",
+                           spot_list(p.cache_key(), (det.alpha, det.min_db, det.min_area_m2), result),
+                           file_name=f"{name}_spots.csv", mime="text/csv", use_container_width=True,
+                           help="Location, size, change and dates of every detected spot.")
 
     with st.expander("Details and method"):
         st.markdown(f"""

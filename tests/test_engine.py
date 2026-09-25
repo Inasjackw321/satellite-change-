@@ -16,10 +16,10 @@ def grid_index(grid, lon, lat):
     return int((grid.y0 - y) / grid.scale), int((x - grid.x0) / grid.scale)
 
 
-def patch_mask(grid, shrink=3):
-    """Output pixels inside the changed patch (a little inside its edge), and a
-    wider ring around it that excludes the patch's blurred edge."""
-    w, s, e, n = conftest.PATCH
+def patch_mask(grid, shrink=3, bounds=conftest.PATCH):
+    """Output pixels inside a patch (a little inside its edge), and a wider
+    ring around it that excludes the patch's blurred edge."""
+    w, s, e, n = bounds
     r0, c0 = grid_index(grid, w, n)
     r1, c1 = grid_index(grid, e, s)
     inside = np.zeros((grid.height, grid.width), bool)
@@ -60,12 +60,38 @@ def test_plan_uses_latest_images_up_to_each_date(offline):
     assert plan.download_mb == pytest.approx(grid.pixels * 2 * 6 * engine.BYTES_PER_PIXEL / 1e6)
 
 
-def test_balanced_detection_finds_the_patch_and_nothing_else(result):
-    inc, dec, spots = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
+def test_balanced_detection_finds_both_patches_and_nothing_else(result):
+    found = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
     inside, ring = patch_mask(result.grid)
-    assert dec[inside].mean() > 0.97 and not inc[inside].any()
-    assert not (inc | dec)[~ring].any()  # no noise anywhere else
-    assert spots == 1
+    busy, busy_ring = patch_mask(result.grid, bounds=conftest.ACTIVITY)
+    assert found.decreased[inside].mean() > 0.97 and not found.increased[inside].any()
+    # Bright on 2 of the 3 after passes: brighter on average.
+    assert found.increased[busy].mean() > 0.97
+    assert not (found.increased | found.decreased)[~ring & ~busy_ring].any()  # no noise elsewhere
+    assert found.spots == 2
+
+
+def test_spots_count_how_many_times_they_changed(result):
+    found = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
+    patch, activity = render.find_spots(result, found)  # largest first
+    assert result.passes == ["2026-06-22", "2026-06-28", "2026-07-04", "2026-07-22", "2026-07-28", "2026-08-03"]
+    # Changed once, between the last before pass and the first after pass.
+    assert patch.times == 1 and patch.when == ["4 Jul 2026 → 22 Jul 2026"]
+    assert patch.change_db == pytest.approx(-7, abs=0.4)
+    w, s, e, n = conftest.PATCH
+    assert w < patch.lon < e and s < patch.lat < n
+    # Came, went and came back.
+    assert activity.times == 3
+    assert activity.when == ["4 Jul 2026 → 22 Jul 2026", "22 Jul 2026 → 28 Jul 2026",
+                             "28 Jul 2026 → 3 Aug 2026"]
+    w, s, e, n = conftest.ACTIVITY
+    assert w < activity.lon < e and s < activity.lat < n
+
+
+def test_pass_to_pass_changes_are_rare_where_nothing_happened(result):
+    _, ring = patch_mask(result.grid)
+    _, busy_ring = patch_mask(result.grid, bounds=conftest.ACTIVITY)
+    assert (result.events[~ring & ~busy_ring] > 0).mean() < 0.01
 
 
 def test_change_size_is_measured(result):
@@ -81,8 +107,9 @@ def test_speckle_filter_raises_looks_and_noise_check_is_clean(result):
     assert result.enl_estimated and 20 < result.enl < 45
     s = render.summarize(result, render.PRESETS["Balanced"])
     assert s.noise_km2 == 0 and s.noise_spots == 0
-    patch_km2 = 0.010 * 111.32 * math.cos(math.radians(50.52)) * 0.007 * 110.57
-    assert s.decrease_km2 == pytest.approx(patch_km2, rel=0.15) and s.increase_km2 == 0
+    km2 = lambda w, s_, e, n: (e - w) * 111.32 * math.cos(math.radians(50.52)) * (n - s_) * 110.57
+    assert s.decrease_km2 == pytest.approx(km2(*conftest.PATCH), rel=0.15)
+    assert s.increase_km2 == pytest.approx(km2(*conftest.ACTIVITY), rel=0.25)
 
 
 def test_sensitive_setting_shows_more_noise_than_balanced(result):
@@ -99,7 +126,9 @@ def test_unfiltered_statistics_still_match_alpha(offline):
     assert result.enl == pytest.approx(conftest.TRUE_ENL, rel=0.08)
     stat, _, _ = stats.decode(result.signed)
     _, ring = patch_mask(result.grid)
-    assert (stat > stats.chi2_threshold(0.01, 2))[~ring].mean() == pytest.approx(0.01, rel=0.25)
+    _, busy_ring = patch_mask(result.grid, bounds=conftest.ACTIVITY)
+    unchanged = ~ring & ~busy_ring
+    assert (stat > stats.chi2_threshold(0.01, 2))[unchanged].mean() == pytest.approx(0.01, rel=0.25)
 
 
 def test_map_and_background_layers(result):
@@ -107,6 +136,8 @@ def test_map_and_background_layers(result):
     assert result.before_db.min() > 0  # full coverage
     html = render.build_map(result, render.Detection()).get_root().render()
     assert html.count("data:image/png;base64,") == 3 and "Before: radar image" in html
+    # A numbered badge per spot, with the dates in its tooltip.
+    assert html.count("L.divIcon") == 2 and "28 Jul 2026 → 3 Aug 2026" in html
 
 
 def test_second_run_is_served_from_cache(offline, monkeypatch):
@@ -132,9 +163,9 @@ def test_single_image_each_side(offline):
     result = engine.run(params, signer=source.Signer())
     assert result.before_days == ["2026-07-04"] and result.after_days == ["2026-08-03"]
     assert result.null_signed is None
-    inc, dec, _ = render.detect(result.signed, result.change_db, render.Detection(), 2)
+    found = render.detect(result.signed, result.change_db, render.Detection(), 2)
     inside, _ = patch_mask(result.grid)
-    assert dec[inside].mean() > 0.9  # the 3x3 filter makes even one pair usable
+    assert found.decreased[inside].mean() > 0.9  # the 3x3 filter makes even one pair usable
 
 
 def test_range_without_images_is_explained(offline):

@@ -32,7 +32,9 @@ LOOKBACK_DAYS = 90  # how far before the start date to look for images
 BYTES_PER_PIXEL = 3.2  # compressed float32 speckle, per band, for download estimates
 MAX_PIXELS = 30e6  # ~3,000 km2 at 10 m
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
-CACHE_VERSION = 3  # bump when the computation or file format changes
+CACHE_VERSION = 4  # bump when the computation or file format changes
+# A change between two single passes (for "how many times a change was seen").
+PASS_ALPHA, PASS_MIN_DB = 1e-3, 2.0
 
 # (west, south, east, north) in degrees.
 CITIES = {
@@ -87,6 +89,10 @@ class Grid:
     def window_latlon(self, col, row, width, height):
         x0, y0 = self.x0 + col * self.scale, self.y0 - row * self.scale
         return [[_lat(y0 - height * self.scale), _lon(x0)], [_lat(y0), _lon(x0 + width * self.scale)]]
+
+    def pixel_latlon(self, row, col):
+        """Latitude and longitude of a (fractional) pixel centre."""
+        return _lat(self.y0 - (row + 0.5) * self.scale), _lon(self.x0 + (col + 0.5) * self.scale)
 
     def row_area_km2(self):
         """Ground area of one pixel in each row (varies with latitude)."""
@@ -161,11 +167,17 @@ class Result:
     orbits: list = field(default_factory=list)
     null_signed: np.ndarray | None = None  # same, for before-vs-before (no-change check)
     null_db: np.ndarray | None = None
+    events: np.ndarray | None = None  # uint16 bitmask: bit i = change between pass i and i + 1
     before_db: np.ndarray | None = None  # uint8 VV backscatter at 40 m, 0 = no data
     after_db: np.ndarray | None = None
     version: int = CACHE_VERSION
 
-    ARRAYS = ("signed", "change_db", "null_signed", "null_db", "before_db", "after_db")
+    ARRAYS = ("signed", "change_db", "null_signed", "null_db", "events", "before_db", "after_db")
+
+    @property
+    def passes(self):
+        """All pass dates in order: before passes, then after passes."""
+        return self.before_days + self.after_days
 
     def save(self, path):
         meta = {k: v for k, v in asdict(self).items() if k not in self.ARRAYS}
@@ -297,21 +309,44 @@ def estimate_enl(plan, grid, signer, bands, smooth=1, pairs=3, size=256):
     return stats.estimate_enl(samples) if samples.size >= 1000 else None
 
 
-def _accumulate(days, scenes_by_day, grid, signer, bands, window, split=False):
-    """Sum and count per band over acquisitions; with split, separately for
-    even and odd acquisitions (for the no-change check)."""
+def _scan(plan, grid, signer, bands, window, crop, smooth, enl):
+    """Read every pass in date order. Returns sums and counts per band for
+    three groups (even before passes, odd before passes, after passes), and a
+    bitmask per pixel: bit i is set when a change was seen between pass i and
+    pass i + 1."""
     c, r, w, h = window
-    groups = 2 if split else 1
-    sums = [{b: np.zeros((h, w)) for b in bands} for _ in range(groups)]
-    counts = [np.zeros((h, w)) for _ in range(groups)]
+    days = list(plan.before) + list(plan.after)
+    n_before = len(plan.before)
+    sums = [{b: np.zeros((h, w)) for b in bands} for _ in range(3)]
+    counts = [np.zeros((h, w)) for _ in range(3)]
+    events = np.zeros((crop[0].stop - crop[0].start, crop[1].stop - crop[1].start), np.uint16)
+    previous = None
     for i, day in enumerate(days):
-        img = _read(grid, scenes_by_day[day], signer, bands, c, r, w, h)
+        img = _read(grid, (plan.before if i < n_before else plan.after)[day], signer, bands, c, r, w, h)
         valid = np.logical_and.reduce([np.isfinite(img[b]) for b in bands])
-        g = i % groups
+        g = i % 2 if i < n_before else 2
+        filled = {b: np.where(valid, img[b], 0) for b in bands}
         for b in bands:
-            sums[g][b] += np.where(valid, img[b], 0)
+            sums[g][b] += filled[b]
         counts[g] += valid
-    return sums, counts
+        current = ({b: _boxcar(filled[b], smooth)[crop] for b in bands},
+                   _boxcar(valid.astype(float), smooth)[crop], valid[crop])
+        if previous is not None:
+            events |= _pass_change(previous, current, bands, enl).astype(np.uint16) << (i - 1)
+        previous = current
+    return sums, counts, events
+
+
+def _pass_change(first, second, bands, enl):
+    """Pixels whose signal clearly changed from one single pass to the next."""
+    (s1, c1, v1), (s2, c2, v2) = first, second
+    ok = v1 & v2
+    c1, c2 = np.maximum(c1, 1e-9), np.maximum(c2, 1e-9)
+    m1 = {b: np.where(ok, s1[b] / c1, 1) for b in bands}
+    m2 = {b: np.where(ok, s2[b] / c2, 1) for b in bands}
+    stat = sum(stats.lrt(m1[b], m2[b], c1 * enl, c2 * enl) for b in bands)
+    change = 10 * np.log10(sum(m2[b] for b in bands) / sum(m1[b] for b in bands))
+    return ok & (stat > stats.chi2_threshold(PASS_ALPHA, len(bands))) & (np.abs(change) >= PASS_MIN_DB)
 
 
 def _compare(sums1, n1, sums2, n2, ok, bands, enl, smooth, crop):
@@ -344,13 +379,14 @@ def process_tile(tile, plan, grid, signer, bands, enl, smooth=1):
     window = (c0, r0, c1 - c0, r1 - r0)
     crop = (slice(r - r0, r - r0 + h), slice(c - c0, c - c0 + w))
 
-    b_sums, b_counts = _accumulate(list(plan.before), plan.before, grid, signer, bands, window, split=True)
-    a_sums, a_counts = _accumulate(list(plan.after), plan.after, grid, signer, bands, window)
+    sums, counts, events = _scan(plan, grid, signer, bands, window, crop, smooth, enl)
+    b_sums, b_counts = sums[:2], counts[:2]
+    a_sum, a_count = sums[2], counts[2]
     before_sum = {b: b_sums[0][b] + b_sums[1][b] for b in bands}
     before_n = b_counts[0] + b_counts[1]
 
-    ok = (before_n[crop] > 0) & (a_counts[0][crop] > 0)
-    signed, db, mean_b, mean_a = _compare(before_sum, before_n, a_sums[0], a_counts[0], ok,
+    ok = (before_n[crop] > 0) & (a_count[crop] > 0)
+    signed, db, mean_b, mean_a = _compare(before_sum, before_n, a_sum, a_count, ok,
                                           bands, enl, smooth, crop)
 
     # No-change check: alternate before acquisitions against each other.
@@ -361,7 +397,7 @@ def process_tile(tile, plan, grid, signer, bands, enl, smooth=1):
                                               bands, enl, smooth, crop)
 
     display = (_to_display(mean_b["VV"], ok), _to_display(mean_a["VV"], ok)) if "VV" in bands else None
-    return signed, db, null_signed, null_db, display
+    return signed, db, null_signed, null_db, np.where(ok, events, 0).astype(np.uint16), display
 
 
 def _to_display(intensity, valid):
@@ -406,6 +442,7 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
     has_null = len(plan.before) >= 2
     null_signed = np.full(shape_, stats.NODATA, np.int16) if has_null else None
     null_db = np.full(shape_, stats.NODATA, np.int16) if has_null else None
+    events = np.zeros(shape_, np.uint16)
     dh, dw = -(-grid.height // DISPLAY_FACTOR), -(-grid.width // DISPLAY_FACTOR)
     before_db, after_db = np.zeros((dh, dw), np.uint8), np.zeros((dh, dw), np.uint8)
     tiles = grid.tiles()
@@ -414,8 +451,9 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
                 for t in tiles}
         for done, job in enumerate(as_completed(jobs), 1):
             c, r, w, h = jobs[job]
-            t_signed, t_db, t_null, t_null_db, display = job.result()
+            t_signed, t_db, t_null, t_null_db, t_events, display = job.result()
             signed[r:r + h, c:c + w], change_db[r:r + h, c:c + w] = t_signed, t_db
+            events[r:r + h, c:c + w] = t_events
             if has_null:
                 null_signed[r:r + h, c:c + w], null_db[r:r + h, c:c + w] = t_null, t_null_db
             if display is not None:
@@ -432,7 +470,7 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
         params=params, grid=grid, signed=signed, change_db=change_db, orbit=plan.orbit,
         before_days=[str(d) for d in plan.before], after_days=[str(d) for d in plan.after],
         enl=float(enl), enl_estimated=estimated, orbits=plan.orbits,
-        null_signed=null_signed, null_db=null_db,
+        null_signed=null_signed, null_db=null_db, events=events,
         before_db=before_db if "VV" in bands else None, after_db=after_db if "VV" in bands else None,
     )
     result.save(cache)

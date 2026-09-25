@@ -17,11 +17,14 @@ from satchange import engine, source
 
 TRUE_ENL = 5.0
 AOI = (30.20, 50.50, 30.26, 50.54)  # ~4.3 x 4.4 km near Irpin
-PATCH = (30.225, 50.515, 30.235, 50.522)  # changed area (lon/lat), ~700 x 780 m
+PATCH = (30.225, 50.515, 30.235, 50.522)  # changed once after the event, ~700 x 780 m
+# "Aircraft coming and going": 10 dB brighter on these passes only.
+ACTIVITY = (30.245, 50.528, 30.250, 50.531)  # ~350 x 330 m
 UTM = "EPSG:32636"
 # An image every 6 days; the patch changes after 4 July 2026.
 DAYS = [dt.date(2026, 5, 29) + dt.timedelta(days=6 * k) for k in range(12)]  # 29 May .. 3 Aug
 EVENT = dt.date(2026, 7, 4)
+ACTIVE_DAYS = {dt.date(2026, 7, 22), dt.date(2026, 8, 3)}
 
 
 def _footprint(bounds_utm):
@@ -43,27 +46,32 @@ class Archive:
         # Varied land cover: mean backscatter between about -20 and 0 dB.
         self.mean = {"VV": 10 ** self.rng.uniform(-2, 0, (self.height, self.width)),
                      "VH": 10 ** self.rng.uniform(-2.8, -0.8, (self.height, self.width))}
-        pw, ps, pe, pn = transform_bounds("EPSG:4326", UTM, *PATCH)
-        cols = ((pw - self.transform.c) / 10, (pe - self.transform.c) / 10)
-        rows = ((self.transform.f - pn) / 10, (self.transform.f - ps) / 10)
-        self.patch = (slice(int(rows[0]), int(rows[1])), slice(int(cols[0]), int(cols[1])))
+        self.patch, self.activity = self._pixels(PATCH), self._pixels(ACTIVITY)
         self.scenes = []
         for day in DAYS:
             # One pass is split into two scenes, like real slices.
             halves = ([(0, self.height // 2), (self.height // 2, self.height)]
                       if day == dt.date(2026, 6, 22) else [(0, self.height)])
-            images = self._acquire(changed=day > EVENT)
+            images = self._acquire(changed=day > EVENT, busy=day in ACTIVE_DAYS)
             for k, (r0, r1) in enumerate(halves):
                 self.scenes.append(self._write(day, k, images, r0, r1, orbit=36))
             # A second orbit that only covers the western third.
             self.scenes.append(self._partial(day))
 
-    def _acquire(self, changed):
+    def _pixels(self, bounds):
+        w, s, e, n = transform_bounds("EPSG:4326", UTM, *bounds)
+        cols = ((w - self.transform.c) / 10, (e - self.transform.c) / 10)
+        rows = ((self.transform.f - n) / 10, (self.transform.f - s) / 10)
+        return slice(int(rows[0]), int(rows[1])), slice(int(cols[0]), int(cols[1]))
+
+    def _acquire(self, changed, busy=False):
         out = {}
         for b, mean in self.mean.items():
             m = mean.copy()
             if changed:
                 m[self.patch] *= 10 ** -0.7  # -7 dB
+            if busy:
+                m[self.activity] *= 10  # +10 dB
             out[b] = (self.rng.gamma(TRUE_ENL, 1 / TRUE_ENL, m.shape) * m).astype(np.float32)
         return out
 
