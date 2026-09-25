@@ -1,3 +1,4 @@
+import datetime as dt
 import math
 
 import numpy as np
@@ -6,8 +7,8 @@ import pytest
 from satchange import engine, render, source, stats
 from tests import conftest
 
-PARAMS = engine.Params(label="Test", bounds=conftest.AOI,
-                       before=("2021-04-01", "2021-06-01"), after=("2022-04-01", "2022-06-01"))
+PARAMS = engine.Params(label="Test", bounds=conftest.AOI, start="2026-07-04", end="2026-08-04")
+D = dt.date
 
 
 def grid_index(grid, lon, lat):
@@ -15,16 +16,17 @@ def grid_index(grid, lon, lat):
     return int((grid.y0 - y) / grid.scale), int((x - grid.x0) / grid.scale)
 
 
-def patch_mask(grid, shrink=2):
-    """Output pixels inside the changed patch (a little inside its edge)."""
+def patch_mask(grid, shrink=3):
+    """Output pixels inside the changed patch (a little inside its edge), and a
+    wider ring around it that excludes the patch's blurred edge."""
     w, s, e, n = conftest.PATCH
     r0, c0 = grid_index(grid, w, n)
     r1, c1 = grid_index(grid, e, s)
-    mask = np.zeros((grid.height, grid.width), bool)
-    mask[r0 + shrink:r1 - shrink, c0 + shrink:c1 - shrink] = True
-    ring = np.zeros_like(mask)
-    ring[r0 - 5:r1 + 5, c0 - 5:c1 + 5] = True
-    return mask, ring
+    inside = np.zeros((grid.height, grid.width), bool)
+    inside[r0 + shrink:r1 - shrink, c0 + shrink:c1 - shrink] = True
+    ring = np.zeros_like(inside)
+    ring[r0 - 6:r1 + 6, c0 - 6:c1 + 6] = True
+    return inside, ring
 
 
 @pytest.fixture
@@ -43,40 +45,67 @@ def test_grid_has_10m_ground_pixels_and_covers_bounds():
     assert side.min() == pytest.approx(10, abs=0.06) and side.max() == pytest.approx(10, abs=0.06)
 
 
-def test_plan_picks_full_coverage_orbit_and_estimates_download(offline):
+def test_date_windows():
+    assert PARAMS.before_window == ("2026-04-05", "2026-07-05")  # up to and including the start
+    assert PARAMS.after_window == ("2026-07-05", "2026-08-05")  # after the start, up to the end
+
+
+def test_plan_uses_latest_images_up_to_each_date(offline):
     plan = engine.make_plan(PARAMS)
     assert plan.orbit == 36  # orbit 109 covers only a third of the area
-    assert {o["orbit"]: round(o["coverage"], 1) for o in plan.orbits}[109] < 0.5
-    assert list(plan.before) == conftest.BEFORE_DAYS and list(plan.after) == conftest.AFTER_DAYS
-    assert len(plan.before[conftest.BEFORE_DAYS[0]]) == 2  # split pass
+    assert list(plan.before) == [D(2026, 6, 22), D(2026, 6, 28), D(2026, 7, 4)]
+    assert list(plan.after) == [D(2026, 7, 22), D(2026, 7, 28), D(2026, 8, 3)]
+    assert len(plan.before[D(2026, 6, 22)]) == 2  # split pass
     grid = engine.Grid.for_bounds(PARAMS.bounds)
-    assert plan.download_mb == pytest.approx(grid.pixels * 2 * 9 * engine.BYTES_PER_PIXEL / 1e6)
+    assert plan.download_mb == pytest.approx(grid.pixels * 2 * 6 * engine.BYTES_PER_PIXEL / 1e6)
 
 
-def test_detects_the_changed_patch_where_it_is(result):
-    grid = result.grid
-    stat, increased, valid = stats.decode(result.signed)
-    assert valid.all()  # the split first pass left no holes
-    inside, ring = patch_mask(grid)
-    flagged = stat > stats.chi2_threshold(0.01, 2)
-    assert flagged[inside].mean() > 0.97 and not increased[inside & flagged].any()
-    # Outside the patch only chance hits remain: ~alpha of unchanged pixels.
-    outside = ~ring
-    assert flagged[outside].mean() == pytest.approx(0.01, rel=0.25)
+def test_balanced_detection_finds_the_patch_and_nothing_else(result):
+    inc, dec, spots = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
+    inside, ring = patch_mask(result.grid)
+    assert dec[inside].mean() > 0.97 and not inc[inside].any()
+    assert not (inc | dec)[~ring].any()  # no noise anywhere else
+    assert spots == 1
 
 
-def test_speckle_estimate_and_no_change_check(result):
-    assert result.enl_estimated and result.enl == pytest.approx(conftest.TRUE_ENL, rel=0.08)
-    s = render.summarize(result, 0.01)
-    assert s.null_rate == pytest.approx(0.01, rel=0.25)
+def test_change_size_is_measured(result):
+    db = result.change_db.astype(float) / 100
+    inside, ring = patch_mask(result.grid)
+    assert np.median(db[inside]) == pytest.approx(-7, abs=0.3)  # the patch lost 7 dB
+    assert abs(np.median(db[~ring])) < 0.2
+
+
+def test_speckle_filter_raises_looks_and_noise_check_is_clean(result):
+    # 3x3 filtering of 5-look images: more looks, but less than 9 x 5 because
+    # nearest-neighbour resampling duplicates some pixels.
+    assert result.enl_estimated and 20 < result.enl < 45
+    s = render.summarize(result, render.PRESETS["Balanced"])
+    assert s.noise_km2 == 0 and s.noise_spots == 0
     patch_km2 = 0.010 * 111.32 * math.cos(math.radians(50.52)) * 0.007 * 110.57
-    assert s.decrease_km2 - s.increase_km2 == pytest.approx(patch_km2, rel=0.15)
+    assert s.decrease_km2 == pytest.approx(patch_km2, rel=0.15) and s.increase_km2 == 0
+
+
+def test_sensitive_setting_shows_more_noise_than_balanced(result):
+    sensitive = render.summarize(result, render.PRESETS["Sensitive"])
+    balanced = render.summarize(result, render.PRESETS["Balanced"])
+    assert sensitive.increase_km2 + sensitive.decrease_km2 >= balanced.increase_km2 + balanced.decrease_km2
+
+
+def test_unfiltered_statistics_still_match_alpha(offline):
+    """Without speckle filter or extra filters the per-pixel test keeps its
+    advertised false-alarm rate."""
+    params = engine.Params(**{**PARAMS.__dict__, "smooth": 1})
+    result = engine.run(params, signer=source.Signer())
+    assert result.enl == pytest.approx(conftest.TRUE_ENL, rel=0.08)
+    stat, _, _ = stats.decode(result.signed)
+    _, ring = patch_mask(result.grid)
+    assert (stat > stats.chi2_threshold(0.01, 2))[~ring].mean() == pytest.approx(0.01, rel=0.25)
 
 
 def test_map_and_background_layers(result):
     assert result.before_db.shape == (-(-result.grid.height // 4), -(-result.grid.width // 4))
     assert result.before_db.min() > 0  # full coverage
-    html = render.build_map(result, 0.01).get_root().render()
+    html = render.build_map(result, render.Detection()).get_root().render()
     assert html.count("data:image/png;base64,") == 3 and "Before: radar image" in html
 
 
@@ -84,27 +113,31 @@ def test_second_run_is_served_from_cache(offline, monkeypatch):
     first = engine.run(PARAMS, signer=source.Signer())
     monkeypatch.setattr(source, "read_day", lambda *a, **k: pytest.fail("should not download"))
     second = engine.run(PARAMS, signer=source.Signer())
-    np.testing.assert_array_equal(first.signed, second.signed)
-    np.testing.assert_array_equal(first.before_db, second.before_db)
+    for name in engine.Result.ARRAYS:
+        np.testing.assert_array_equal(getattr(first, name), getattr(second, name))
     assert second.params == first.params and second.grid == first.grid
 
 
-def test_single_pair_vv_only_with_manual_enl(offline):
-    params = engine.Params(**{**PARAMS.__dict__, "max_images": 1, "enl": 5.0, "bands": ("VV",)})
+def test_old_saved_results_are_ignored(offline):
+    result = engine.run(PARAMS, signer=source.Signer())
+    result.version = 2
+    result.save(engine.CACHE_DIR / "old.npz")
+    with pytest.raises(ValueError):
+        engine.Result.load(engine.CACHE_DIR / "old.npz")
+    assert [p.name for p, _ in engine.saved_results()] == [f"{PARAMS.cache_key()}.npz"]
+
+
+def test_single_image_each_side(offline):
+    params = engine.Params(**{**PARAMS.__dict__, "images": 1})
     result = engine.run(params, signer=source.Signer())
-    assert result.before_days == [str(conftest.BEFORE_DAYS[-1])]
-    assert result.after_days == [str(conftest.AFTER_DAYS[0])]
-    assert result.enl == 5.0 and not result.enl_estimated and result.null_hist is None
-    stat, _, _ = stats.decode(result.signed)
-    inside, ring = patch_mask(result.grid)
-    flagged = stat > stats.chi2_threshold(0.01, 1)
-    assert flagged[~ring].mean() == pytest.approx(0.01, rel=0.25)
-    # One pair is far less sensitive: theory gives 40.6% detection of a
-    # 7 dB drop at 5 looks and alpha = 0.01 (vs >97% with 5 + 4 images).
-    assert flagged[inside].mean() == pytest.approx(0.406, abs=0.03)
+    assert result.before_days == ["2026-07-04"] and result.after_days == ["2026-08-03"]
+    assert result.null_signed is None
+    inc, dec, _ = render.detect(result.signed, result.change_db, render.Detection(), 2)
+    inside, _ = patch_mask(result.grid)
+    assert dec[inside].mean() > 0.9  # the 3x3 filter makes even one pair usable
 
 
-def test_no_common_orbit_is_explained(offline):
-    params = engine.Params(**{**PARAMS.__dict__, "after": ("2023-01-01", "2023-02-01")})
-    with pytest.raises(ValueError, match="same orbit in both periods"):
+def test_range_without_images_is_explained(offline):
+    params = engine.Params(**{**PARAMS.__dict__, "start": "2026-08-04", "end": "2026-08-10"})
+    with pytest.raises(ValueError, match="Try a longer date range"):
         engine.make_plan(params)

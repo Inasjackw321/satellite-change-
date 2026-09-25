@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from satchange.stats import NODATA, NOMINAL_ENL, chi2_threshold, decode, estimate_enl, exceedance, lrt
+from satchange.stats import NODATA, NOMINAL_ENL, chi2_threshold, decode, estimate_enl, lrt
 
 N = 400_000
 
@@ -66,21 +66,6 @@ def test_estimate_enl_with_some_change_errs_conservative():
     b[: n // 20] *= 10  # 5% of pixels changed by 10 dB
     log_ratio = np.log(a / b) + 0.2  # plus a global offset between dates
     assert 0.85 * 4.4 < estimate_enl(log_ratio) <= 4.4
-
-
-def test_exceedance_interpolates_within_bin():
-    counts = np.array([10, 10, 10, 10])  # uniform on [0, 4) with bin width 1
-    assert exceedance(counts, 1.0, 0.0) == pytest.approx(1.0)
-    assert exceedance(counts, 1.0, 2.5) == pytest.approx(0.375)
-    assert exceedance(counts, 1.0, 9.0) == 0.0
-
-
-def test_exceedance_of_simulated_null_matches_alpha():
-    rng = np.random.default_rng(5)
-    L = NOMINAL_ENL * 3
-    stat = sum(lrt(speckle(rng, m, L), speckle(rng, m, L), L, L) for m in (0.2, 0.04))
-    counts, _ = np.histogram(np.minimum(stat, 49.99), bins=500, range=(0, 50))
-    assert exceedance(counts, 0.1, chi2_threshold(0.01, 2)) == pytest.approx(0.01, rel=0.05)
 
 
 def test_decode():

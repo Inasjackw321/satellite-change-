@@ -1,5 +1,3 @@
-import datetime as dt
-
 import pytest
 
 from satchange import engine, inputs
@@ -24,17 +22,6 @@ def test_fit_area_trims_huge_area_to_limit():
     g = engine.Grid.for_bounds(bounds)
     assert g.pixels <= engine.MAX_PIXELS and "trimmed" in note
     assert (bounds[0] + bounds[2]) / 2 == pytest.approx(31.0)
-
-
-def test_periods_for_event_is_same_season_a_year_apart():
-    before, after = inputs.periods_for_event(dt.date(2022, 4, 1), weeks=8)
-    assert after == (dt.date(2022, 4, 1), dt.date(2022, 5, 26))
-    assert before == (dt.date(2021, 4, 1), dt.date(2021, 5, 26))
-
-
-def test_periods_for_event_on_leap_day():
-    before, _ = inputs.periods_for_event(dt.date(2024, 2, 29), weeks=4)
-    assert before[0] == dt.date(2023, 2, 28)
 
 
 def test_search_places_parses_nominatim(monkeypatch):
@@ -63,7 +50,7 @@ def test_saved_results_lists_and_deletes(monkeypatch, tmp_path):
     (tmp_path / "broken.npz").write_bytes(b"not a zip")
     saved = engine.saved_results()
     assert [p.name for p, _ in saved] == ["a.npz"]
-    assert saved[0][1].startswith("Testville: 2021-04 → 2022-04")
+    assert saved[0][1] == "Testville: 4 Jul 2026 → 4 Aug 2026"
     engine.delete_saved()
     assert engine.saved_results() == []
 

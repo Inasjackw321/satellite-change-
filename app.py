@@ -17,7 +17,9 @@ from satchange import engine, inputs, render, source
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("SATCHANGE_CONFIG", ROOT / "config.json"))
-ALPHAS = [0.1, 0.05, 0.01, 0.001, 1e-4, 1e-5, 1e-6]
+ALPHAS = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+AREAS = [100, 200, 400, 1000, 2000, 5000, 10000]
+SMOOTHING = {"Off (10 m detail)": 1, "Medium (recommended)": 3, "Strong": 5}
 SEARCH, DRAWN, COORDS = "Search for a place…", "Drawn on the map", "Enter coordinates…"
 CHOOSE, RESULT = "✏️ Choose area", "🗺️ Change map"
 SATELLITE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
@@ -49,9 +51,10 @@ def size(mb):
     return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:,.0f} MB"
 
 
-def fmt_period(period):
-    start, end = period
-    return f"{start:%d %b %Y} – {end:%d %b %Y}"
+def fmt_days(days):
+    """'22 Jun, 28 Jun, 4 Jul 2026'"""
+    days = sorted(days)
+    return ", ".join(f"{d.day} {d:%b}" for d in days) + f" {days[-1].year}"
 
 
 @st.cache_data(show_spinner="Searching…", ttl=3600)
@@ -65,8 +68,14 @@ def find_images(key, _params):
 
 
 @st.cache_data(show_spinner="Drawing map…", max_entries=8)
-def map_html(key, alpha, _result):
-    return render.build_map(_result, alpha).get_root().render()
+def map_html(key, det, _result):
+    return render.build_map(_result, render.Detection(*det)).get_root().render()
+
+
+def describe(det):
+    return (f"Shows spots where the radar signal changed by at least **{det.min_db:g} dB** over at "
+            f"least **{det.min_area_m2:,.0f} m²**, with less than a **1 in {1 / det.alpha:,.0f}** "
+            "chance per pixel of being noise.")
 
 
 # When a new box is drawn, remove the old one, so there is only ever one area.
@@ -179,53 +188,45 @@ with st.sidebar:
 
     # 2. Dates
     st.subheader("2 · Dates")
-    if not st.toggle("Choose both periods myself"):
-        after_start = st.date_input(
-            "Look for changes that happened before", dt.date(2022, 4, 1), format="DD/MM/YYYY",
-            help="The 'after' images start on this date.")
-        weeks = st.select_slider("Length of each period", [4, 6, 8, 12, 16], value=8,
-                                 format_func=lambda w: f"{w} weeks")
-        before, after = inputs.periods_for_event(after_start, weeks)
-        st.caption(f"**Before:** {fmt_period(before)}  \n**After:** {fmt_period(after)}  \n"
-                   "Same season a year apart, so leaves, snow and crops don't count as change.")
-    else:
-        before = st.date_input("Before period", (dt.date(2021, 4, 1), dt.date(2021, 5, 31)),
-                               format="DD/MM/YYYY")
-        after = st.date_input("After period", (dt.date(2022, 4, 1), dt.date(2022, 5, 31)),
-                              format="DD/MM/YYYY")
-
-    max_images = st.select_slider(
-        "Images per period", [1, 2, 3, 4, 6, 8, 12], value=4,
-        help="More images find smaller changes but take longer to download. "
-             "1 is the tutorial's single before/after pair.")
+    latest = dt.date.today() - dt.timedelta(days=3)  # new images take a few days to appear
+    c1, c2 = st.columns(2)
+    start = c1.date_input("Start", latest - dt.timedelta(days=31), format="DD/MM/YYYY", key="start")
+    end = c2.date_input("End", latest, format="DD/MM/YYYY", key="end")
+    st.caption("Compares the latest images up to the start date with the latest images up to "
+               "the end date.")
+    images = st.select_slider(
+        "Images to average on each side", [1, 2, 3, 4, 6], value=3,
+        help="Averaging several images removes more noise, so smaller changes can be found. "
+             "More images mean a bigger download and reach further back from each date.")
 
     with st.expander("Advanced settings"):
+        smooth = SMOOTHING[st.selectbox(
+            "Noise reduction", list(SMOOTHING), index=1,
+            help="Averages neighbouring pixels before comparing. Removes most radar speckle; "
+                 "the smallest detail becomes about 30 m (Medium) or 50 m (Strong).")]
         orbit_pass = st.selectbox("Orbit direction", ["Any", "ASCENDING", "DESCENDING"])
         orbit = st.number_input("Relative orbit (0 = best available)", 0, 175, 0)
-        auto_enl = st.checkbox("Estimate speckle level from the data", True,
-                               help="Equivalent number of looks (ENL). Nominal Sentinel-1 value is 4.4.")
-        enl = None if auto_enl else st.number_input("Equivalent number of looks", 1.0, 50.0, 4.4)
+        auto_enl = st.checkbox("Measure speckle level from the data", True,
+                               help="Equivalent number of looks (ENL) of one image after noise reduction.")
+        enl = None if auto_enl else st.number_input("Equivalent number of looks", 1.0, 200.0, 4.4)
         bands = st.multiselect("Polarisations", ["VV", "VH"], ["VV", "VH"])
 
     # Check the dates and look up the images before anything is downloaded.
     problem, params, plan, cached = None, None, None, False
-    if len(before) != 2 or len(after) != 2:
-        problem = "Pick a start and an end date for both periods."
-    elif before[1] >= after[0]:
-        problem = "The before period must end before the after period starts."
-    elif after[0] > dt.date.today():
-        problem = "The after period starts in the future, so there are no images yet."
+    if start >= end:
+        problem = "The end date must be after the start date."
+    elif end > dt.date.today():
+        problem = "The end date is in the future, so there are no images for it yet."
+    elif start < dt.date(2014, 10, 1):
+        problem = "Sentinel-1 images start in October 2014."
     elif not bands:
         problem = "Choose at least one polarisation."
     elif bounds:
-        one_day = dt.timedelta(days=1)
         params = engine.Params(
-            label=label, bounds=tuple(float(b) for b in bounds),
-            before=(str(before[0]), str(before[1] + one_day)),  # end exclusive
-            after=(str(after[0]), str(after[1] + one_day)),
+            label=label, bounds=tuple(float(b) for b in bounds), start=str(start), end=str(end),
+            images=int(images), smooth=smooth,
             orbit_pass=None if orbit_pass == "Any" else orbit_pass,
-            orbit=int(orbit) or None, max_images=int(max_images),
-            enl=enl, bands=tuple(b for b in ("VV", "VH") if b in bands),
+            orbit=int(orbit) or None, enl=enl, bands=tuple(b for b in ("VV", "VH") if b in bands),
         )
         cached = (engine.CACHE_DIR / f"{params.cache_key()}.npz").exists()
         if not cached:  # a saved result opens without going online
@@ -241,11 +242,13 @@ with st.sidebar:
     elif cached:
         st.info("Already computed: opens instantly.")
     elif plan:
-        st.info(f"Found **{len(plan.before)} before** and **{len(plan.after)} after** images "
-                f"(orbit {plan.orbit}, {plan.orbit_state}).  \n"
-                f"Download: about **{size(plan.download_mb)}**.")
+        st.info(f"**Before:** {fmt_days(plan.before)}  \n**After:** {fmt_days(plan.after)}  \n"
+                f"Orbit {plan.orbit} ({plan.orbit_state}) · download about **{size(plan.download_mb)}**")
+        gaps = [(start - max(plan.before)).days, (end - max(plan.after)).days]
+        if max(gaps) > 14:
+            st.warning(f"The nearest images are up to {max(gaps)} days before your dates.")
         if plan.download_mb > BIG_DOWNLOAD_MB:
-            st.warning("That's a big download. A smaller area or fewer images per period is faster.")
+            st.warning("That's a big download. A smaller area or fewer images is faster.")
 
     run = st.button("Find changes", type="primary", use_container_width=True,
                     disabled=not (plan or cached))
@@ -296,10 +299,11 @@ if view == CHOOSE:
     if result is None:
         st.header("Radar change map")
         st.markdown(
-            "Compares Sentinel-1 radar images from before and after a date, and marks every 10 m "
-            "spot whose radar signal changed more than noise can explain: demolished or new "
-            "buildings, cleared land, flooding and so on. Radar sees through clouds and at night. "
-            "Images are free from Microsoft Planetary Computer; no account is needed.")
+            "Compares Sentinel-1 radar images from a start date and an end date, and marks spots "
+            "whose radar signal clearly changed: demolished or new buildings, vehicles and "
+            "aircraft coming and going, cleared land, flooding and so on. Radar sees through "
+            "clouds and at night. Images are free from Microsoft Planetary Computer; no account "
+            "is needed.")
     st.subheader("Choose an area")
     st.markdown(
         "**Drag a box on the map:** click **▢** (top left), then click and drag across the map. "
@@ -316,51 +320,68 @@ if view == CHOOSE:
                    "Then choose the dates and press **Find changes** in the sidebar.")
 else:
     p = result.params
-    st.header(f"{p.label}: radar change")
-    alpha = st.select_slider(
-        "Sensitivity: how often an unchanged spot may be flagged by chance (α)",
-        options=ALPHAS, value=0.01, format_func=lambda a: f"{a:g}",
-        help="Smaller values show only the clearest changes.",
-    )
-    s = render.summarize(result, alpha)
+    st.header(f"{p.label}: {engine.short_date(p.start)} → {engine.short_date(p.end)}")
+    st.caption(f"Before: {fmt_days(dt.date.fromisoformat(d) for d in result.before_days)} · "
+               f"After: {fmt_days(dt.date.fromisoformat(d) for d in result.after_days)}")
+
+    c1, c2 = st.columns([2, 3])
+    preset = c1.radio("Detection", [*render.PRESETS, "Custom"], index=1, horizontal=True, key="preset",
+                      help="Sensitive shows smaller and fainter changes, Strict only big, clear ones.")
+    if preset == "Custom":
+        with c2:
+            base = render.PRESETS["Balanced"]
+            det = render.Detection(
+                alpha=st.select_slider("Certainty (chance a pixel is noise)", ALPHAS, value=base.alpha,
+                                       format_func=lambda a: f"1 in {1 / a:,.0f}"),
+                min_db=st.slider("Smallest change in radar signal (dB)", 0.5, 10.0, base.min_db, 0.5,
+                                 help="3 dB = the signal halved or doubled."),
+                min_area_m2=st.select_slider("Smallest patch (m²)", AREAS, value=base.min_area_m2,
+                                             format_func=lambda a: f"{a:,}"),
+            )
+    else:
+        det = render.PRESETS[preset]
+        c2.markdown(describe(det))
+    s = render.summarize(result, det)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Radar signal decreased", km2(s.decrease_km2),
-              help="Often demolished or damaged buildings, cleared land, flooding.")
+              help="Often demolished or damaged buildings, cleared land, flooding, "
+                   "vehicles or aircraft that left.")
     c2.metric("Radar signal increased", km2(s.increase_km2),
-              help="Often new structures, rubble, debris, vehicles, vegetation.")
-    c3.metric("Expected by chance", km2(s.expected_km2),
-              help=f"α × area analysed ({s.analysed_km2:,.0f} km²). Flagged area well above "
-                   "this is real change.")
-    if s.null_rate is not None:
-        c4.metric("No-change check", f"{s.null_rate:.2%} flagged",
-                  help="The same test comparing the before period with itself, where nothing "
-                       f"should change. Close to α ({alpha:.2%}) means the statistics can be trusted.")
+              help="Often new structures, rubble, vehicles or aircraft that arrived, "
+                   "vegetation.")
+    c3.metric("Changed spots", f"{s.spots:,}")
+    if s.noise_km2 is not None:
+        c4.metric("Noise check", km2(s.noise_km2),
+                  help="The same detection comparing the before images with each other, where "
+                       "nothing should have changed. Close to 0 means what's shown is real change.")
 
-    html = map_html(p.cache_key(), alpha, result)
+    html = map_html(p.cache_key(), (det.alpha, det.min_db, det.min_area_m2), result)
     st.iframe(html, height=680)
     st.caption("Red: radar signal decreased · Cyan: increased · Use the layer menu (top right) "
-               "to see the before/after radar images. A flagged spot means something changed, not "
-               "necessarily damage; look for clusters rather than scattered single spots.")
+               "to see the before and after radar images. A change in radar signal means "
+               "something changed on the ground, not necessarily damage.")
 
     c1, _ = st.columns([1, 3])
     c1.download_button("Download map (HTML)", html,
-                       file_name=f"{p.label.lower().replace(' ', '_')}_change_{alpha:g}.html",
+                       file_name=f"{p.label.lower().replace(' ', '_')}_{p.start}_{p.end}.html",
                        mime="text/html", use_container_width=True)
 
     with st.expander("Details and method"):
         st.markdown(f"""
 - **Images:** Sentinel-1 (radiometrically terrain-corrected, from Microsoft Planetary
-  Computer), relative orbit **{result.orbit}**, {len(result.before_days)} before
-  acquisitions ({', '.join(result.before_days)}) and {len(result.after_days)} after
-  ({', '.join(result.after_days)}).
-- **Speckle level:** ENL = **{result.enl:.2f}**
-  ({'measured from consecutive before images' if result.enl_estimated else 'set manually / nominal'};
-  Sentinel-1 nominal 4.4).
-- **Test:** likelihood-ratio test for equal mean backscatter per pixel
+  Computer), relative orbit **{result.orbit}**: the latest {len(result.before_days)} up to the
+  start date and the latest {len(result.after_days)} up to the end date, averaged on each side.
+- **Noise reduction:** {p.smooth} × {p.smooth} pixel averaging. Speckle level after it:
+  ENL = **{result.enl:.1f}** per image ({'measured from consecutive before images'
+  if result.enl_estimated else 'set manually'}).
+- **Test:** likelihood-ratio test for equal mean radar signal per pixel
   ({' + '.join(p.bands)}), with Bartlett correction, χ² with {len(p.bands)} dof.
-  Threshold at α = {alpha:g}: **{s.threshold:.2f}**.
-- **Resolution:** computed at 10 m for every pixel ({result.grid.width} × {result.grid.height}).
+- **Filters:** a pixel is shown only if the test is significant (chance of noise below
+  1 in {1 / det.alpha:,.0f}), the signal changed by at least {det.min_db:g} dB, and it is part
+  of a patch of at least {det.min_area_m2:,.0f} m².
+- **Noise check:** the same test and filters comparing the before images with each other.
+- **Grid:** {result.grid.width} × {result.grid.height} pixels of 10 m.
 """)
         if result.orbits:
             st.caption("Orbits considered")

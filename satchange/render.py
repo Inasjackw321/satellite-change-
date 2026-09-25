@@ -12,42 +12,67 @@ from jinja2 import Template
 import numpy as np
 from PIL import Image
 
-from .engine import DISPLAY_FACTOR, NULL_BINS, NULL_MAX
-from .stats import chi2_threshold, decode, exceedance
+from scipy import ndimage
+
+from .engine import DISPLAY_FACTOR, GROUND_RES
+from .stats import chi2_threshold, decode
 
 DECREASE = "#ff3b30"
 INCREASE = "#00c8ff"
 
 
+@dataclass(frozen=True)
+class Detection:
+    """What counts as a change. A pixel must pass all three filters."""
+    alpha: float = 1e-5  # statistical significance (chance of flagging an unchanged pixel)
+    min_db: float = 3.0  # the radar signal must change by at least this much
+    min_area_m2: float = 400  # and be part of a patch at least this big
+
+
+PRESETS = {
+    "Sensitive": Detection(alpha=1e-3, min_db=1.5, min_area_m2=100),
+    "Balanced": Detection(),
+    "Strict": Detection(alpha=1e-7, min_db=6.0, min_area_m2=2000),
+}
+
+
 @dataclass
 class Summary:
-    alpha: float
-    threshold: float
     analysed_km2: float
     increase_km2: float
     decrease_km2: float
-    null_rate: float | None  # fraction flagged in the before-vs-before check
-
-    @property
-    def expected_km2(self):
-        return self.alpha * self.analysed_km2
+    spots: int
+    noise_km2: float | None  # detected in the before-vs-before comparison, where nothing changed
+    noise_spots: int | None
 
 
-def _flags(result, alpha):
-    threshold = chi2_threshold(alpha, dof=len(result.params.bands))
-    stat, increased, valid = decode(result.signed)
-    flagged = valid & (stat > threshold)
-    return threshold, valid, flagged & increased, flagged & ~increased
+def detect(signed, change_db, det, dof):
+    """(increased, decreased, number of spots) after all three filters."""
+    stat, _, valid = decode(signed)
+    db = change_db.astype(np.float32) / 100
+    flag = valid & (stat > chi2_threshold(det.alpha, dof)) & (np.abs(db) >= det.min_db)
+    labels, n = ndimage.label(flag, structure=np.ones((3, 3)))
+    spots = 0
+    if n:
+        min_px = max(1, int(np.ceil(det.min_area_m2 / GROUND_RES ** 2)))
+        keep = np.bincount(labels.ravel()) >= min_px
+        keep[0] = False
+        flag, spots = keep[labels], int(keep.sum())
+    increased = db > 0
+    return flag & increased, flag & ~increased, spots
 
 
-def summarize(result, alpha):
-    threshold, valid, inc, dec = _flags(result, alpha)
+def summarize(result, det):
+    dof = len(result.params.bands)
     row_area = result.grid.row_area_km2()
     km2 = lambda mask: float(mask.sum(axis=1) @ row_area)
-    null_rate = None
-    if result.null_hist is not None:
-        null_rate = exceedance(result.null_hist, NULL_MAX / NULL_BINS, threshold)
-    return Summary(alpha, threshold, km2(valid), km2(inc), km2(dec), null_rate)
+    inc, dec, spots = detect(result.signed, result.change_db, det, dof)
+    valid = decode(result.signed)[2]
+    noise_km2 = noise_spots = None
+    if result.null_signed is not None:
+        n_inc, n_dec, noise_spots = detect(result.null_signed, result.null_db, det, dof)
+        noise_km2 = km2(n_inc | n_dec)
+    return Summary(km2(valid), km2(inc), km2(dec), spots, noise_km2, noise_spots)
 
 
 def _span(days):
@@ -63,9 +88,9 @@ def _hex_rgb(color):
     return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
 
 
-def overlay_png(result, alpha):
-    """RGBA PNG (as a data URL) of the flagged pixels; the rest transparent."""
-    _, _, inc, dec = _flags(result, alpha)
+def overlay_png(result, det):
+    """RGBA PNG (as a data URL) of the detected changes; the rest transparent."""
+    inc, dec, _ = detect(result.signed, result.change_db, det, len(result.params.bands))
     rgba = np.zeros(inc.shape + (4,), dtype=np.uint8)
     rgba[dec] = _hex_rgb(DECREASE) + (255,)
     rgba[inc] = _hex_rgb(INCREASE) + (255,)
@@ -83,7 +108,7 @@ def backscatter_png(db):
     return _png(Image.fromarray(np.dstack([db, db, db, np.where(db > 0, 255, 0).astype(np.uint8)]), "RGBA"))
 
 
-def build_map(result, alpha):
+def build_map(result, det):
     p = result.params
     (south, west), (north, east) = result.grid.latlon_bounds()
     m = folium.Map(location=[(south + north) / 2, (west + east) / 2], zoom_start=11,
@@ -103,8 +128,8 @@ def build_map(result, alpha):
             ).add_to(m)
 
     folium.raster_layers.ImageOverlay(
-        overlay_png(result, alpha), bounds=[[south, west], [north, east]],
-        name=f"Significant change (α = {alpha:g})",
+        overlay_png(result, det), bounds=[[south, west], [north, east]],
+        name="Detected changes",
         attr="Contains modified Copernicus Sentinel data (via Microsoft Planetary Computer)",
     ).add_to(m)
     w, s, e, n = p.bounds

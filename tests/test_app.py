@@ -11,18 +11,21 @@ APP = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
 def synthetic_result():
+    """A small result with a 200 m x 200 m block that lost 7 dB, plus noise."""
     params = engine.Params(label="Testville", bounds=(30.0, 50.0, 30.02, 50.02),
-                           before=("2021-04-01", "2021-06-01"), after=("2022-04-01", "2022-06-01"))
+                           start="2026-07-04", end="2026-08-04")
     grid = engine.Grid.for_bounds(params.bounds)
     rng = np.random.default_rng(0)
     stat = rng.chisquare(2, (grid.height, grid.width))
-    stat[:20, :20] = 60  # a 200 m x 200 m block of strong change
-    signed = np.round(stat * stats.STAT_SCALE * -1).astype(np.int16)
-    null = sum(rng.chisquare(1, 100_000) for _ in range(2))
-    hist, _ = np.histogram(np.minimum(null, 49.99), bins=engine.NULL_BINS, range=(0, engine.NULL_MAX))
-    return engine.Result(params=params, grid=grid, signed=signed, orbit=36,
-                         before_days=["2021-04-01", "2021-04-13"], after_days=["2022-04-01"],
-                         enl=4.8, enl_estimated=True, null_hist=hist, orbits=[])
+    db = rng.normal(0, 0.5, stat.shape)
+    stat[:20, :20], db[:20, :20] = 60, -7
+    encode = lambda st, d: (np.round(st * stats.STAT_SCALE * np.sign(d)).astype(np.int16),
+                            np.round(d * 100).astype(np.int16))
+    signed, change_db = encode(stat, db)
+    null_signed, null_db = encode(rng.chisquare(2, stat.shape), rng.normal(0, 0.5, stat.shape))
+    return engine.Result(params=params, grid=grid, signed=signed, change_db=change_db, orbit=36,
+                         before_days=["2026-06-28", "2026-07-04"], after_days=["2026-08-03"],
+                         enl=40.0, enl_estimated=True, null_signed=null_signed, null_db=null_db)
 
 
 _ARCHIVE = []
@@ -45,7 +48,14 @@ def button(at, label):
     return next(b for b in at.button if b.label == label)
 
 
+def set_dates(at, start="2026-07-04", end="2026-08-04"):
+    at.sidebar.date_input(key="start").set_value(start)
+    at.sidebar.date_input(key="end").set_value(end)
+    at.run()
+
+
 def choose_test_area(at):
+    set_dates(at)
     at.sidebar.selectbox[0].set_value("Enter coordinates…").run()
     w, s, e, n = conftest.AOI
     for label, v in (("West", w), ("East", e), ("South", s), ("North", n)):
@@ -58,8 +68,14 @@ def test_first_open_needs_no_account(app):
     assert not app.exception
     labels = [b.label for b in app.button]
     assert "Find changes" in labels and not any("Sign" in l for l in labels)
+
+
+def test_images_found_for_the_dates_are_listed(app):
+    app.run()
+    set_dates(app)
     info = " ".join(i.value for i in app.sidebar.info)
-    assert "Found **4 before** and **4 after** images" in info and "Download: about" in info
+    assert "**Before:** 22 Jun, 28 Jun, 4 Jul 2026" in info
+    assert "**After:** 22 Jul, 28 Jul, 3 Aug 2026" in info and "download about" in info
     assert not button(app, "Find changes").disabled
 
 
@@ -68,11 +84,11 @@ def test_find_changes_end_to_end(app):
     choose_test_area(app)
     button(app, "Find changes").click().run()
     assert not app.exception and not app.error
-    assert "My area" in app.header[0].value
+    assert "My area: 4 Jul 2026 → 4 Aug 2026" in app.header[0].value
     metrics = {m.label: m.value for m in app.metric}
-    patch = float(metrics["Radar signal decreased"].split()[0])
-    assert 0.4 < patch < 0.8  # the ~0.55 km2 patch plus chance hits
-    assert metrics["No-change check"].endswith("flagged")
+    assert 0.45 < float(metrics["Radar signal decreased"].split()[0]) < 0.65  # the ~0.55 km2 patch
+    assert metrics["Radar signal increased"] == "0.00 km²"
+    assert metrics["Changed spots"] == "1" and metrics["Noise check"] == "0.00 km²"
     # Now saved: it reopens instantly, even offline.
     assert any("Already computed" in i.value for i in app.sidebar.info)
     source_search = source.search
@@ -88,7 +104,7 @@ def test_find_changes_end_to_end(app):
 def test_area_without_images_is_explained(app, monkeypatch):
     far_away = [source.Scene(**{**s.__dict__, "geometry": {
         "type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}})
-        for s in conftest.Archive.search(app_archive(), None, "2021-01-01", "2023-01-01")]
+        for s in conftest.Archive.search(app_archive(), None, "2026-01-01", "2027-01-01")]
     monkeypatch.setattr(source, "search", lambda b, start, end, session=None: [
         s for s in far_away if str(start) <= str(s.day) < str(end)])
     app.run()
@@ -109,30 +125,36 @@ def test_archive_problems_are_shown(app, monkeypatch):
 
 def test_dates_in_wrong_order_are_explained(app):
     app.run()
-    app.sidebar.toggle[0].set_value(True).run()
-    app.sidebar.date_input[0].set_value(("2022-04-01", "2022-05-01")).run()
-    assert any("before period must end before" in e.value for e in app.sidebar.error)
+    set_dates(app, "2026-08-04", "2026-07-04")
+    assert any("end date must be after the start date" in e.value for e in app.sidebar.error)
+    assert button(app, "Find changes").disabled
 
 
-def test_simple_dates_show_both_periods(app):
+def test_range_without_images_is_explained(app):
     app.run()
-    text = " ".join(c.value for c in app.sidebar.caption)
-    assert "01 Apr 2021 – 26 May 2021" in text and "01 Apr 2022 – 26 May 2022" in text
+    set_dates(app, "2026-08-04", "2026-08-10")
+    assert any("Try a longer date range" in e.value for e in app.sidebar.error)
 
 
-def test_result_view_updates_with_alpha(app):
+def test_detection_settings(app):
     app.session_state["result"] = synthetic_result()
     app.run()
     assert not app.exception
-    metrics = {m.label: m.value for m in app.metric}
-    assert float(metrics["Radar signal decreased"].split()[0]) > 0.04
+    metrics = lambda: {m.label: m.value for m in app.metric}
+    # Balanced: only the 0.04 km2 block, and the noise check is clean.
+    assert metrics()["Radar signal decreased"] == "0.04 km²" and metrics()["Changed spots"] == "1"
+    assert metrics()["Noise check"] == "0.00 km²"
 
-    app.select_slider[0].set_value(1e-6)
+    # Custom with loose settings lets noise through, and the noise check shows it.
+    app.radio(key="preset").set_value("Custom").run()
+    app.select_slider[0].set_value(1e-2)
+    app.slider[0].set_value(0.5)
+    app.select_slider[1].set_value(100)
     app.run()
-    metrics = {m.label: m.value for m in app.metric}
-    # At alpha = 1e-6 essentially only the 0.04 km2 block remains.
-    assert float(metrics["Radar signal decreased"].split()[0]) == pytest.approx(0.04, abs=0.002)
-    assert metrics["No-change check"].startswith("0.00")
+    assert float(metrics()["Noise check"].split()[0]) > 0 and int(metrics()["Changed spots"]) > 1
+
+    app.radio(key="preset").set_value("Strict").run()
+    assert metrics()["Changed spots"] == "1" and metrics()["Noise check"] == "0.00 km²"
 
 
 def test_saved_maps_can_be_reopened_and_deleted(app, tmp_path):
@@ -154,9 +176,10 @@ def test_drawing_a_box_sets_the_area(app, monkeypatch):
     monkeypatch.setattr(streamlit_folium, "st_folium",
                         lambda m, **kw: drawn.append(m) or {"all_drawings": [box]})
     app.run()
+    set_dates(app)
     assert not app.exception
     assert app.sidebar.selectbox[0].value == "Drawn on the map"
-    assert any("Found **4 before**" in i.value for i in app.sidebar.info)
+    assert any("**Before:** 22 Jun" in i.value for i in app.sidebar.info)
     # The picker map now shows the drawn box, with the draw tool.
     html = drawn[-1].get_root().render()
     assert "L.Control.Draw" in html and f"{n}" in html

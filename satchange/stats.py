@@ -105,18 +105,3 @@ def decode(signed):
     valid = signed != NODATA
     stat = np.abs(signed.astype(np.float32)) / STAT_SCALE
     return stat, signed > 0, valid
-
-
-def exceedance(hist_counts, bin_width, threshold):
-    """Fraction of a histogram (bins starting at 0) above ``threshold``,
-    interpolating linearly inside the bin that contains it."""
-    counts = np.asarray(hist_counts, dtype=float)
-    total = counts.sum()
-    if total == 0:
-        return float("nan")
-    pos = threshold / bin_width
-    i = int(pos)
-    if i >= counts.size:
-        return 0.0
-    above = counts[i + 1:].sum() + counts[i] * (1 - (pos - i))
-    return float(above / total)

@@ -1,6 +1,5 @@
 """Helpers that turn simple user choices into analysis inputs."""
 
-import datetime as dt
 import math
 
 import requests
@@ -49,21 +48,6 @@ def fit_area(bounds, max_pixels=MAX_PIXELS, min_side_km=MIN_SIDE_KM):
         note = "Too big for a 10 m analysis, so trimmed to the central area."
     fitted = (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
     return tuple(round(v, 5) for v in fitted), note
-
-
-def _year_earlier(day):
-    try:
-        return day.replace(year=day.year - 1)
-    except ValueError:  # 29 February
-        return day.replace(year=day.year - 1, day=28)
-
-
-def periods_for_event(after_start, weeks=8):
-    """After period: ``weeks`` from ``after_start``. Before period: the same
-    weeks one year earlier, so seasonal changes (leaves, snow, soil moisture)
-    cancel out. Both as inclusive (start, end) dates."""
-    after_end = after_start + dt.timedelta(weeks=weeks) - dt.timedelta(days=1)
-    return (_year_earlier(after_start), _year_earlier(after_end)), (after_start, after_end)
 
 
 def bounds_from_drawings(drawings):

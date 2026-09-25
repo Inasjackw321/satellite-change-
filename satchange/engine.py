@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 from shapely.geometry import box, shape
 from shapely.ops import unary_union
 
@@ -27,11 +28,11 @@ EARTH_RADIUS = 6378137.0
 GROUND_RES = 10.0  # metres, Sentinel-1 pixel spacing
 TILE = 1024
 DISPLAY_FACTOR = 4  # before/after background layers at 40 m
-NULL_MAX, NULL_BINS = 50.0, 500
+LOOKBACK_DAYS = 90  # how far before the start date to look for images
 BYTES_PER_PIXEL = 3.2  # compressed float32 speckle, per band, for download estimates
 MAX_PIXELS = 30e6  # ~3,000 km2 at 10 m
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
-CACHE_VERSION = 2  # bump when the computation changes
+CACHE_VERSION = 3  # bump when the computation or file format changes
 
 # (west, south, east, north) in degrees.
 CITIES = {
@@ -106,15 +107,28 @@ class Grid:
 
 @dataclass(frozen=True)
 class Params:
+    """An analysis: compare the latest images up to ``start`` with the latest
+    images up to ``end`` (and after ``start``)."""
     label: str
     bounds: tuple  # (west, south, east, north)
-    before: tuple  # (start, end) YYYY-MM-DD, end exclusive
-    after: tuple
+    start: str  # YYYY-MM-DD
+    end: str
+    images: int = 3  # images averaged on each side
+    smooth: int = 3  # speckle filter window in pixels (1 = none)
     orbit_pass: str | None = None  # "ASCENDING" / "DESCENDING"
     orbit: int | None = None
-    max_images: int = 0  # per period; 0 = all
-    enl: float | None = None  # None = estimate from the data
+    enl: float | None = None  # None = measure from the data
     bands: tuple = ("VV", "VH")
+
+    @property
+    def before_window(self):
+        start = dt.date.fromisoformat(self.start)
+        return str(start - dt.timedelta(days=LOOKBACK_DAYS)), str(start + dt.timedelta(days=1))
+
+    @property
+    def after_window(self):
+        start, end = dt.date.fromisoformat(self.start), dt.date.fromisoformat(self.end)
+        return str(start + dt.timedelta(days=1)), str(end + dt.timedelta(days=1))
 
     def cache_key(self):
         blob = json.dumps([CACHE_VERSION, asdict(self)], sort_keys=True).encode()
@@ -137,18 +151,21 @@ class Plan:
 class Result:
     params: Params
     grid: Grid
-    signed: np.ndarray  # int16, see stats.decode
+    signed: np.ndarray  # int16 test statistic signed by direction, see stats.decode
+    change_db: np.ndarray  # int16 change of total backscatter in 0.01 dB
     orbit: int
     before_days: list
     after_days: list
-    enl: float
+    enl: float  # per image, after the speckle filter
     enl_estimated: bool
-    null_hist: np.ndarray | None  # counts, bins of NULL_MAX / NULL_BINS from 0
     orbits: list = field(default_factory=list)
+    null_signed: np.ndarray | None = None  # same, for before-vs-before (no-change check)
+    null_db: np.ndarray | None = None
     before_db: np.ndarray | None = None  # uint8 VV backscatter at 40 m, 0 = no data
     after_db: np.ndarray | None = None
+    version: int = CACHE_VERSION
 
-    ARRAYS = ("signed", "null_hist", "before_db", "after_db")
+    ARRAYS = ("signed", "change_db", "null_signed", "null_db", "before_db", "after_db")
 
     def save(self, path):
         meta = {k: v for k, v in asdict(self).items() if k not in self.ARRAYS}
@@ -160,6 +177,8 @@ class Result:
     def load(cls, path):
         with np.load(path) as f:
             meta = json.loads(str(f["meta"]))
+            if meta.get("version") != CACHE_VERSION:
+                raise ValueError("saved with an older version of the app")
             meta["params"] = Params(**{k: tuple(v) if isinstance(v, list) else v
                                        for k, v in meta["params"].items()})
             meta["grid"] = Grid(**meta["grid"])
@@ -182,9 +201,11 @@ def _coverage(scenes, aoi):
 
 
 def make_plan(params, session=None):
-    """Search the archive and pick the images to use."""
-    before = source.search(params.bounds, *params.before, session=session)
-    after = source.search(params.bounds, *params.after, session=session)
+    """Search the archive and pick the images: the latest ``images`` up to the
+    start date, and the latest ``images`` up to the end date (after the start),
+    all from one orbit so the viewing geometry is identical."""
+    before = source.search(params.bounds, *params.before_window, session=session)
+    after = source.search(params.bounds, *params.after_window, session=session)
     if params.orbit_pass:
         keep = params.orbit_pass.lower()
         before = [s for s in before if s.orbit_state == keep]
@@ -194,25 +215,28 @@ def make_plan(params, session=None):
     if params.orbit is not None:
         candidates = [o for o in candidates if o == params.orbit]
     if not candidates:
-        raise ValueError("No radar images were taken from the same orbit in both periods. "
-                         "Try longer periods or different dates.")
+        raise ValueError("No radar images were taken from the same orbit before the start date "
+                         "and between the start and end dates. Try a longer date range.")
 
+    start, end = dt.date.fromisoformat(params.start), dt.date.fromisoformat(params.end)
     aoi = box(*params.bounds)
     table = []
     for o in candidates:
         cover = min(_coverage([s for d in b[o].values() for s in d], aoi),
                     _coverage([s for d in a[o].values() for s in d], aoi))
-        table.append({"orbit": o, "coverage": cover, "before": len(b[o]), "after": len(a[o])})
+        gap = (start - max(b[o])).days + (end - max(a[o])).days
+        table.append({"orbit": o, "coverage": cover, "before": len(b[o]), "after": len(a[o]),
+                      "gap_days": gap})
 
     def score(row):
+        # Full coverage first, then images closest to the two dates, then more images.
         full = row["coverage"] > 0.98
-        return (full, min(row["before"], row["after"]) if full else row["coverage"])
+        return (full, row["coverage"] if not full else 0, -row["gap_days"],
+                min(row["before"], row["after"]))
 
     orbit = max(table, key=score)["orbit"]
-    before_days, after_days = sorted(b[orbit]), sorted(a[orbit])
-    if params.max_images:
-        # Keep the acquisitions closest to the event.
-        before_days, after_days = before_days[-params.max_images:], after_days[:params.max_images]
+    n = params.images
+    before_days, after_days = sorted(b[orbit])[-n:], sorted(a[orbit])[-n:]
 
     grid = Grid.for_bounds(params.bounds)
     reads = len(before_days) + len(after_days)
@@ -236,20 +260,36 @@ def _read(grid, scenes, signer, bands, col, row, width, height):
     return source.read_day(touching, signer, CRS, grid.transform(col, row), width, height, bands)
 
 
-def estimate_enl(plan, grid, signer, bands, pairs=3, size=256):
-    """ENL from consecutive single before acquisitions, sampled in four
-    windows spread over the area. Returns None if there's too little data."""
-    days = list(plan.all_before)[: pairs + 1]
+def _boxcar(a, k):
+    """Mean over a k x k window (zero outside the array)."""
+    return a if k <= 1 else ndimage.uniform_filter(a.astype(np.float64), size=k, mode="constant")
+
+
+def estimate_enl(plan, grid, signer, bands, smooth=1, pairs=3, size=256):
+    """ENL of single images after the speckle filter, from consecutive before
+    acquisitions sampled in four windows spread over the area. Returns None if
+    there's too little data."""
+    days = list(plan.all_before)[-(pairs + 1):]
     if len(days) < 2:
         return None
     s = min(size, grid.width, grid.height)
+    m = smooth // 2
     windows = {(max(0, int(fx * grid.width) - s // 2), max(0, int(fy * grid.height) - s // 2))
                for fx in (0.3, 0.7) for fy in (0.3, 0.7)}
     samples = []
     for c, r in windows:
         w, h = min(s, grid.width - c), min(s, grid.height - r)
-        imgs = [_read(grid, plan.all_before[d], signer, bands, c, r, w, h) for d in days]
-        for a, b in zip(imgs, imgs[1:]):
+        filtered = []
+        for d in days:
+            img = _read(grid, plan.all_before[d], signer, bands, c, r, w, h)
+            valid = np.logical_and.reduce([np.isfinite(img[b]) for b in bands])
+            share = _boxcar(valid.astype(float), smooth)
+            full = share > 1 - 1e-9  # only pixels whose whole window is valid
+            if m:
+                full[:m], full[-m:], full[:, :m], full[:, -m:] = False, False, False, False
+            filtered.append({b: np.where(full, _boxcar(np.where(valid, img[b], 0), smooth), np.nan)
+                             for b in bands})
+        for a, b in zip(filtered, filtered[1:]):
             for band in bands:
                 lr = np.log(a[band] / b[band])
                 samples.append(lr[np.isfinite(lr)])
@@ -257,13 +297,13 @@ def estimate_enl(plan, grid, signer, bands, pairs=3, size=256):
     return stats.estimate_enl(samples) if samples.size >= 1000 else None
 
 
-def _accumulate(days, scenes_by_day, grid, signer, bands, tile, split=False):
+def _accumulate(days, scenes_by_day, grid, signer, bands, window, split=False):
     """Sum and count per band over acquisitions; with split, separately for
     even and odd acquisitions (for the no-change check)."""
-    c, r, w, h = tile
+    c, r, w, h = window
     groups = 2 if split else 1
     sums = [{b: np.zeros((h, w)) for b in bands} for _ in range(groups)]
-    counts = [np.zeros((h, w), dtype=np.int32) for _ in range(groups)]
+    counts = [np.zeros((h, w)) for _ in range(groups)]
     for i, day in enumerate(days):
         img = _read(grid, scenes_by_day[day], signer, bands, c, r, w, h)
         valid = np.logical_and.reduce([np.isfinite(img[b]) for b in bands])
@@ -274,15 +314,54 @@ def _accumulate(days, scenes_by_day, grid, signer, bands, tile, split=False):
     return sums, counts
 
 
-def _test(sum1, n1, sum2, n2, bands, enl):
-    """Summed statistic over bands, plus whether the total intensity rose."""
-    ok = (n1 > 0) & (n2 > 0)
-    safe1, safe2 = np.maximum(n1, 1), np.maximum(n2, 1)
-    mean1 = {b: np.where(ok, sum1[b] / safe1, 1) for b in bands}
-    mean2 = {b: np.where(ok, sum2[b] / safe2, 1) for b in bands}
-    stat = sum(stats.lrt(mean1[b], mean2[b], safe1 * enl, safe2 * enl) for b in bands)
-    increased = sum(mean2[b] for b in bands) > sum(mean1[b] for b in bands)
-    return stat, increased, ok, mean1, mean2
+def _compare(sums1, n1, sums2, n2, ok, bands, enl, smooth, crop):
+    """Speckle-filter both sides, then test. Returns (signed, change_db) as
+    int16 arrays, plus the filtered means for display."""
+    mean = {}
+    for side, sums, n in ((1, sums1, n1), (2, sums2, n2)):
+        count = _boxcar(n, smooth)[crop]  # images x share of the window that is valid
+        safe = np.maximum(count, 1e-9)
+        mean[side] = ({b: _boxcar(sums[b], smooth)[crop] / safe for b in bands}, safe)
+    (m1, c1), (m2, c2) = mean[1], mean[2]
+    m1 = {b: np.where(ok, m1[b], 1) for b in bands}
+    m2 = {b: np.where(ok, m2[b], 1) for b in bands}
+    stat = sum(stats.lrt(m1[b], m2[b], c1 * enl, c2 * enl) for b in bands)
+    span1, span2 = sum(m1[b] for b in bands), sum(m2[b] for b in bands)
+    change = 10 * np.log10(span2 / span1)
+    direction = np.where(change > 0, 1, -1)
+    signed = np.round(np.minimum(stat, stats.STAT_MAX) * stats.STAT_SCALE * direction)
+    signed = np.where(ok, signed, stats.NODATA).astype(np.int16)
+    db = np.where(ok, np.round(np.clip(change, -300, 300) * 100), stats.NODATA).astype(np.int16)
+    return signed, db, m1, m2
+
+
+def process_tile(tile, plan, grid, signer, bands, enl, smooth=1):
+    c, r, w, h = tile
+    # Read a margin around the tile so the speckle filter is seamless.
+    m = smooth // 2
+    c0, r0 = max(0, c - m), max(0, r - m)
+    c1, r1 = min(grid.width, c + w + m), min(grid.height, r + h + m)
+    window = (c0, r0, c1 - c0, r1 - r0)
+    crop = (slice(r - r0, r - r0 + h), slice(c - c0, c - c0 + w))
+
+    b_sums, b_counts = _accumulate(list(plan.before), plan.before, grid, signer, bands, window, split=True)
+    a_sums, a_counts = _accumulate(list(plan.after), plan.after, grid, signer, bands, window)
+    before_sum = {b: b_sums[0][b] + b_sums[1][b] for b in bands}
+    before_n = b_counts[0] + b_counts[1]
+
+    ok = (before_n[crop] > 0) & (a_counts[0][crop] > 0)
+    signed, db, mean_b, mean_a = _compare(before_sum, before_n, a_sums[0], a_counts[0], ok,
+                                          bands, enl, smooth, crop)
+
+    # No-change check: alternate before acquisitions against each other.
+    null_signed = null_db = None
+    if len(plan.before) >= 2:
+        null_ok = (b_counts[0][crop] > 0) & (b_counts[1][crop] > 0)
+        null_signed, null_db, _, _ = _compare(b_sums[0], b_counts[0], b_sums[1], b_counts[1], null_ok,
+                                              bands, enl, smooth, crop)
+
+    display = (_to_display(mean_b["VV"], ok), _to_display(mean_a["VV"], ok)) if "VV" in bands else None
+    return signed, db, null_signed, null_db, display
 
 
 def _to_display(intensity, valid):
@@ -300,34 +379,14 @@ def _to_display(intensity, valid):
     return np.where(np.isfinite(db), out, 0).astype(np.uint8)
 
 
-def process_tile(tile, plan, grid, signer, bands, enl):
-    c, r, w, h = tile
-    b_sums, b_counts = _accumulate(list(plan.before), plan.before, grid, signer, bands, tile, split=True)
-    a_sums, a_counts = _accumulate(list(plan.after), plan.after, grid, signer, bands, tile)
-
-    before_sum = {b: b_sums[0][b] + b_sums[1][b] for b in bands}
-    n_before = b_counts[0] + b_counts[1]
-    stat, increased, ok, mean_b, mean_a = _test(before_sum, n_before, a_sums[0], a_counts[0], bands, enl)
-    direction = np.where(increased, 1, -1)
-    signed = np.round(np.minimum(stat, stats.STAT_MAX) * stats.STAT_SCALE * direction)
-    signed = np.where(ok, signed, stats.NODATA).astype(np.int16)
-
-    # No-change check: alternate before acquisitions against each other.
-    hist = np.zeros(NULL_BINS, dtype=np.int64)
-    if len(plan.before) >= 2:
-        null_stat, _, null_ok, _, _ = _test(b_sums[0], b_counts[0], b_sums[1], b_counts[1], bands, enl)
-        hist, _ = np.histogram(np.minimum(null_stat[null_ok], NULL_MAX - 1e-6),
-                               bins=NULL_BINS, range=(0, NULL_MAX))
-
-    return (signed, hist, _to_display(mean_b["VV"], ok) if "VV" in bands else None,
-            _to_display(mean_a["VV"], ok) if "VV" in bands else None)
-
-
 def run(params, progress=lambda fraction, message: None, use_cache=True, plan=None,
         signer=None, workers=6):
     cache = CACHE_DIR / f"{params.cache_key()}.npz"
     if use_cache and cache.exists():
-        return Result.load(cache)
+        try:
+            return Result.load(cache)
+        except ValueError:
+            pass  # older format: recompute
 
     progress(0.02, "Searching the Sentinel-1 archive…")
     plan = plan or make_plan(params)
@@ -335,29 +394,34 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
     grid = Grid.for_bounds(params.bounds)
     bands = list(params.bands)
 
-    enl, estimated = params.enl or stats.NOMINAL_ENL, False
+    enl, estimated = params.enl or stats.NOMINAL_ENL * params.smooth ** 2, False
     if params.enl is None:
         progress(0.06, "Measuring the speckle level…")
-        measured = estimate_enl(plan, grid, signer, bands)
+        measured = estimate_enl(plan, grid, signer, bands, smooth=params.smooth)
         if measured is not None:
             enl, estimated = measured, True
 
-    signed = np.full((grid.height, grid.width), stats.NODATA, dtype=np.int16)
+    shape_ = (grid.height, grid.width)
+    signed, change_db = np.full(shape_, stats.NODATA, np.int16), np.full(shape_, stats.NODATA, np.int16)
+    has_null = len(plan.before) >= 2
+    null_signed = np.full(shape_, stats.NODATA, np.int16) if has_null else None
+    null_db = np.full(shape_, stats.NODATA, np.int16) if has_null else None
     dh, dw = -(-grid.height // DISPLAY_FACTOR), -(-grid.width // DISPLAY_FACTOR)
     before_db, after_db = np.zeros((dh, dw), np.uint8), np.zeros((dh, dw), np.uint8)
-    null_hist = np.zeros(NULL_BINS, dtype=np.int64)
     tiles = grid.tiles()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        jobs = {pool.submit(process_tile, t, plan, grid, signer, bands, enl): t for t in tiles}
+        jobs = {pool.submit(process_tile, t, plan, grid, signer, bands, enl, params.smooth): t
+                for t in tiles}
         for done, job in enumerate(as_completed(jobs), 1):
             c, r, w, h = jobs[job]
-            tile_signed, hist, disp_b, disp_a = job.result()
-            signed[r:r + h, c:c + w] = tile_signed
-            null_hist += hist
-            if disp_b is not None:
+            t_signed, t_db, t_null, t_null_db, display = job.result()
+            signed[r:r + h, c:c + w], change_db[r:r + h, c:c + w] = t_signed, t_db
+            if has_null:
+                null_signed[r:r + h, c:c + w], null_db[r:r + h, c:c + w] = t_null, t_null_db
+            if display is not None:
                 f = DISPLAY_FACTOR
-                before_db[r // f:r // f + disp_b.shape[0], c // f:c // f + disp_b.shape[1]] = disp_b
-                after_db[r // f:r // f + disp_a.shape[0], c // f:c // f + disp_a.shape[1]] = disp_a
+                for target, d in zip((before_db, after_db), display):
+                    target[r // f:r // f + d.shape[0], c // f:c // f + d.shape[1]] = d
             progress(0.1 + 0.88 * done / len(tiles),
                      f"Downloading and comparing images: part {done} of {len(tiles)}")
 
@@ -365,10 +429,10 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
         raise ValueError("The satellite images don't cover this area. Try a different area "
                          "or orbit direction.")
     result = Result(
-        params=params, grid=grid, signed=signed, orbit=plan.orbit,
+        params=params, grid=grid, signed=signed, change_db=change_db, orbit=plan.orbit,
         before_days=[str(d) for d in plan.before], after_days=[str(d) for d in plan.after],
-        enl=float(enl), enl_estimated=estimated,
-        null_hist=null_hist if len(plan.before) >= 2 else None, orbits=plan.orbits,
+        enl=float(enl), enl_estimated=estimated, orbits=plan.orbits,
+        null_signed=null_signed, null_db=null_db,
         before_db=before_db if "VV" in bands else None, after_db=after_db if "VV" in bands else None,
     )
     result.save(cache)
@@ -379,18 +443,25 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
 # --- Saved results ------------------------------------------------------------
 
 def saved_results():
-    """[(path, description)] of cached results, newest first."""
+    """[(path, description)] of cached results, newest first. Results saved by
+    older versions of the app are skipped."""
     out = []
     for path in sorted(CACHE_DIR.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             with np.load(path) as f:
                 meta = json.loads(str(f["meta"]))
+            if meta.get("version") != CACHE_VERSION:
+                continue
         except (OSError, ValueError, KeyError):
             continue
-        saved = dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%d %b %Y")
-        out.append((path, f"{meta['params']['label']}: {meta['before_days'][0][:7]} → "
-                          f"{meta['after_days'][0][:7]} (saved {saved})"))
+        p = meta["params"]
+        out.append((path, f"{p['label']}: {short_date(p['start'])} → {short_date(p['end'])}"))
     return out
+
+
+def short_date(day):
+    d = dt.date.fromisoformat(day)
+    return f"{d.day} {d:%b %Y}"
 
 
 def delete_saved():

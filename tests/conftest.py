@@ -19,8 +19,9 @@ TRUE_ENL = 5.0
 AOI = (30.20, 50.50, 30.26, 50.54)  # ~4.3 x 4.4 km near Irpin
 PATCH = (30.225, 50.515, 30.235, 50.522)  # changed area (lon/lat), ~700 x 780 m
 UTM = "EPSG:32636"
-BEFORE_DAYS = [dt.date(2021, 4, 1) + dt.timedelta(days=12 * k) for k in range(5)]
-AFTER_DAYS = [dt.date(2022, 4, 1) + dt.timedelta(days=12 * k) for k in range(4)]
+# An image every 6 days; the patch changes after 4 July 2026.
+DAYS = [dt.date(2026, 5, 29) + dt.timedelta(days=6 * k) for k in range(12)]  # 29 May .. 3 Aug
+EVENT = dt.date(2026, 7, 4)
 
 
 def _footprint(bounds_utm):
@@ -47,10 +48,11 @@ class Archive:
         rows = ((self.transform.f - pn) / 10, (self.transform.f - ps) / 10)
         self.patch = (slice(int(rows[0]), int(rows[1])), slice(int(cols[0]), int(cols[1])))
         self.scenes = []
-        for day in BEFORE_DAYS + AFTER_DAYS:
-            # The first pass is split into two scenes, like real slices.
-            halves = [(0, self.height // 2), (self.height // 2, self.height)] if day == BEFORE_DAYS[0] else [(0, self.height)]
-            images = self._acquire(changed=day >= AFTER_DAYS[0])
+        for day in DAYS:
+            # One pass is split into two scenes, like real slices.
+            halves = ([(0, self.height // 2), (self.height // 2, self.height)]
+                      if day == dt.date(2026, 6, 22) else [(0, self.height)])
+            images = self._acquire(changed=day > EVENT)
             for k, (r0, r1) in enumerate(halves):
                 self.scenes.append(self._write(day, k, images, r0, r1, orbit=36))
             # A second orbit that only covers the western third.
