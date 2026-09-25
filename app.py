@@ -8,13 +8,19 @@ from pathlib import Path
 
 import folium
 import streamlit as st
+import streamlit_folium
+from branca.element import MacroElement
+from folium.plugins import Draw
+from jinja2 import Template
 
 from satchange import engine, inputs, render, source
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("SATCHANGE_CONFIG", ROOT / "config.json"))
 ALPHAS = [0.1, 0.05, 0.01, 0.001, 1e-4, 1e-5, 1e-6]
-SEARCH, COORDS = "Search for a place…", "Enter coordinates…"
+SEARCH, DRAWN, COORDS = "Search for a place…", "Drawn on the map", "Enter coordinates…"
+CHOOSE, RESULT = "✏️ Choose area", "🗺️ Change map"
+SATELLITE = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 BIG_DOWNLOAD_MB = 500
 
 st.set_page_config(page_title="Satellite Change Map", page_icon="🛰️", layout="wide")
@@ -63,19 +69,66 @@ def map_html(key, alpha, _result):
     return render.build_map(_result, alpha).get_root().render()
 
 
-def area_preview(bounds):
-    west, south, east, north = bounds
-    m = folium.Map(tiles=None)
-    folium.TileLayer(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery",
+# When a new box is drawn, remove the old one, so there is only ever one area.
+# Rendered as a child of the drawing layer: _parent is the layer, its parent the map.
+KEEP_NEWEST = """
+{% macro script(this, kwargs) %}
+{{ this._parent._parent.get_name() }}.on('draw:created', function(e) {
+  var group = {{ this._parent.get_name() }};
+  group.eachLayer(function(layer) { if (layer !== e.layer) { group.removeLayer(layer); } });
+});
+{% endmacro %}
+"""
+
+
+def area_picker(bounds):
+    """Map where the area can be drawn (square tool) or resized (pencil tool).
+    Returns the drawn shapes, or None."""
+    m = folium.Map(location=[50.45, 30.52], zoom_start=10, tiles=None, control_scale=True)
+    folium.TileLayer(SATELLITE, attr="Esri World Imagery", name="Satellite photo").add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Street map", show=False).add_to(m)
+    group = folium.FeatureGroup(name="Area", control=False).add_to(m)
+    if bounds:
+        west, south, east, north = bounds
+        folium.Rectangle([[south, west], [north, east]], color="#ffcc00", weight=3,
+                         fill=True, fill_opacity=0.08).add_to(group)
+        m.fit_bounds([[south, west], [north, east]], padding=(30, 30))
+    Draw(
+        feature_group=group, show_geometry_on_click=False,
+        draw_options={"rectangle": {"shapeOptions": {"color": "#ffcc00", "weight": 3, "fillOpacity": 0.08}},
+                      "polyline": False, "polygon": False,
+                      "circle": False, "marker": False, "circlemarker": False},
+        edit_options={"remove": False},
     ).add_to(m)
-    folium.Rectangle([[south, west], [north, east]], color="#ffcc00", weight=2, fill=False).add_to(m)
-    m.fit_bounds([[south, west], [north, east]])
-    return m.get_root().render()
+    folium.LayerControl(position="bottomright").add_to(m)
+    keep = MacroElement()
+    keep._template = Template(KEEP_NEWEST)
+    group.add_child(keep)
+    state = streamlit_folium.st_folium(m, key="area_picker", height=560, use_container_width=True,
+                                       returned_objects=["all_drawings"])
+    return (state or {}).get("all_drawings")
 
 
 cfg = load_config()
+
+# Widget values set by the previous run (a widget's value can only be changed
+# before it is drawn).
+for key in ("area_choice", "view"):
+    if f"pending_{key}" in ss:
+        ss[key] = ss.pop(f"pending_{key}")
+
+# The last box drawn on the map is remembered between sessions.
+if "drawn" not in ss and cfg.get("drawn"):
+    ss.drawn = tuple(cfg["drawn"])
+
+# Reopen the last result without recomputing.
+if "result" not in ss and cfg.get("last_result"):
+    path = engine.CACHE_DIR / f"{cfg['last_result']}.npz"
+    if path.exists():
+        try:
+            ss.result = engine.Result.load(path)
+        except Exception:
+            pass
 
 # --- Sidebar -------------------------------------------------------------
 with st.sidebar:
@@ -84,10 +137,17 @@ with st.sidebar:
 
     # 1. Area
     st.subheader("1 · Area")
-    area_choice = st.selectbox("Area", [*engine.CITIES, SEARCH, COORDS], label_visibility="collapsed")
+    area_choice = st.selectbox("Area", [*engine.CITIES, SEARCH, DRAWN, COORDS], key="area_choice",
+                               label_visibility="collapsed")
     label, bounds, note = area_choice, None, None
     if area_choice in engine.CITIES:
         bounds = engine.CITIES[area_choice]
+    elif area_choice == DRAWN:
+        label = st.text_input("Name", "My area", key="drawn_name")
+        if ss.get("drawn"):
+            bounds, note = inputs.fit_area(ss.drawn)
+        else:
+            st.caption("Draw a box on the map →")
     elif area_choice == SEARCH:
         query = st.text_input("Place name", placeholder="e.g. Kharkiv, Ukraine")
         if query.strip():
@@ -198,6 +258,7 @@ with st.sidebar:
             c1, c2 = st.columns(2)
             if c1.button("Open", use_container_width=True):
                 ss.result = engine.Result.load(paths[pick])
+                ss.pending_view = RESULT
                 save_config(last_result=paths[pick].stem)
                 st.rerun()
             if c2.button("Delete all", use_container_width=True):
@@ -219,32 +280,40 @@ if run:
         st.error(f"Something went wrong: {e}")
     else:
         ss.result = result
+        ss.pending_view = RESULT
         save_config(last_result=params.cache_key())
         st.rerun()  # redraw the sidebar, which now knows the result is saved
 
-# Reopen the last result without recomputing.
-if "result" not in ss and cfg.get("last_result"):
-    path = engine.CACHE_DIR / f"{cfg['last_result']}.npz"
-    if path.exists():
-        try:
-            ss.result = engine.Result.load(path)
-        except Exception:
-            pass
-
 # --- Main area ------------------------------------------------------------
 result = ss.get("result")
-if result is None:
-    st.header("Radar change map")
+if result is not None:
+    ss.setdefault("view", RESULT)
+    view = st.radio("View", [CHOOSE, RESULT], key="view", horizontal=True, label_visibility="collapsed")
+else:
+    view = CHOOSE
+
+if view == CHOOSE:
+    if result is None:
+        st.header("Radar change map")
+        st.markdown(
+            "Compares Sentinel-1 radar images from before and after a date, and marks every 10 m "
+            "spot whose radar signal changed more than noise can explain: demolished or new "
+            "buildings, cleared land, flooding and so on. Radar sees through clouds and at night. "
+            "Images are free from Microsoft Planetary Computer; no account is needed.")
+    st.subheader("Choose an area")
     st.markdown(
-        "Compares Sentinel-1 radar images from before and after a date, and marks every 10 m "
-        "spot whose radar signal changed more than noise can explain: demolished or new "
-        "buildings, cleared land, flooding and so on. Radar sees through clouds and at night.\n\n"
-        "1. Choose an area\n2. Choose a date\n3. Press **Find changes**\n\n"
-        "Images come free from Microsoft Planetary Computer; no account is needed. "
-        "Results are saved on this computer and reopen instantly.")
+        "**Drag a box on the map:** click **▢** (top left), then click and drag across the map. "
+        "To adjust it, click **✎**, drag the corners or the middle, then click **Save**. "
+        "Scroll to zoom, drag to move around. Or pick a place in the sidebar.")
+    new = inputs.bounds_from_drawings(area_picker(bounds))
+    if new and new != ss.get("drawn"):
+        ss.drawn = new
+        ss.pending_area_choice = DRAWN
+        save_config(drawn=list(new))
+        st.rerun()
     if bounds:
-        st.caption(f"Area to analyse: {label}")
-        st.iframe(area_preview(bounds), height=420)
+        st.caption(f"**{label}**: about {inputs.area_km2(bounds):,.0f} km². {note or ''} "
+                   "Then choose the dates and press **Find changes** in the sidebar.")
 else:
     p = result.params
     st.header(f"{p.label}: radar change")

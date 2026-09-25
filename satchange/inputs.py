@@ -64,3 +64,17 @@ def periods_for_event(after_start, weeks=8):
     cancel out. Both as inclusive (start, end) dates."""
     after_end = after_start + dt.timedelta(weeks=weeks) - dt.timedelta(days=1)
     return (_year_earlier(after_start), _year_earlier(after_end)), (after_start, after_end)
+
+
+def bounds_from_drawings(drawings):
+    """(west, south, east, north) of the most recently drawn shape, or None."""
+    if not drawings:
+        return None
+    geometry = (drawings[-1] or {}).get("geometry") or {}
+    if geometry.get("type") != "Polygon" or not geometry.get("coordinates"):
+        return None
+    lons, lats = zip(*((p[0], p[1]) for p in geometry["coordinates"][0]))
+    west, south, east, north = min(lons), min(lats), max(lons), max(lats)
+    if east - west < 1e-6 or north - south < 1e-6:
+        return None
+    return tuple(round(v, 5) for v in (west, south, east, north))

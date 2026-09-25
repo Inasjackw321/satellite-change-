@@ -143,3 +143,47 @@ def test_saved_maps_can_be_reopened_and_deleted(app, tmp_path):
     assert not app.exception and "Testville" in app.header[0].value
     button(app, "Delete all").click().run()
     assert engine.saved_results() == [] and "Radar change map" in app.header[0].value
+
+
+def test_drawing_a_box_sets_the_area(app, monkeypatch):
+    import streamlit_folium
+    w, s_, e, n = conftest.AOI
+    box = {"type": "Feature", "properties": {}, "geometry": {
+        "type": "Polygon", "coordinates": [[[w, s_], [w, n], [e, n], [e, s_], [w, s_]]]}}
+    drawn = []
+    monkeypatch.setattr(streamlit_folium, "st_folium",
+                        lambda m, **kw: drawn.append(m) or {"all_drawings": [box]})
+    app.run()
+    assert not app.exception
+    assert app.sidebar.selectbox[0].value == "Drawn on the map"
+    assert any("Found **4 before**" in i.value for i in app.sidebar.info)
+    # The picker map now shows the drawn box, with the draw tool.
+    html = drawn[-1].get_root().render()
+    assert "L.Control.Draw" in html and f"{n}" in html
+    button(app, "Find changes").click().run()
+    assert not app.exception and "My area" in app.header[0].value
+    assert app.radio[0].value == "🗺️ Change map"
+
+
+def test_view_switch_returns_to_the_area_picker(app, monkeypatch):
+    import streamlit_folium
+    calls = []
+    monkeypatch.setattr(streamlit_folium, "st_folium", lambda m, **kw: calls.append(kw) or None)
+    app.session_state["result"] = synthetic_result()
+    app.run()
+    assert app.radio[0].value == "🗺️ Change map" and not calls
+    app.radio[0].set_value("✏️ Choose area").run()
+    assert not app.exception and calls and calls[-1]["key"] == "area_picker"
+
+
+def test_drawn_box_is_remembered_next_time(app, monkeypatch, tmp_path):
+    import streamlit_folium
+    box = {"type": "Feature", "properties": {}, "geometry": {
+        "type": "Polygon", "coordinates": [[[30.2, 50.5], [30.2, 50.54], [30.26, 50.54], [30.26, 50.5], [30.2, 50.5]]]}}
+    monkeypatch.setattr(streamlit_folium, "st_folium", lambda m, **kw: {"all_drawings": [box]})
+    app.run()
+    monkeypatch.setattr(streamlit_folium, "st_folium", lambda m, **kw: None)
+    fresh = AppTest.from_file(APP, default_timeout=60)
+    fresh.run()
+    fresh.sidebar.selectbox[0].set_value("Drawn on the map").run()
+    assert any("About 19 km²" in c.value for c in fresh.sidebar.caption)

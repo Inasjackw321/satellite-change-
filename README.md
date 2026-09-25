@@ -26,9 +26,13 @@ browser; close the launcher window to stop it.
 
 In the sidebar:
 
-1. **Area:** pick a Kyiv area, **search for any place by name** (using
-   OpenStreetMap's place search), or enter coordinates. Very small areas are
-   enlarged to at least 4 km across; very large ones are trimmed.
+1. **Area:** **drag a box on the map**: click the square button at the top
+   left of the map, then click and drag. To adjust the box, click the pencil
+   button, drag its corners or middle, and click **Save**. You can also pick a
+   Kyiv area, **search for any place by name** (using OpenStreetMap's place
+   search), or enter coordinates. Very small areas are enlarged to at least
+   4 km across; very large ones are trimmed. The last box you drew is
+   remembered.
 2. **Dates:** pick the date the changes happened before. The app compares the
    weeks after that date with the same weeks one year earlier, so seasons don't
    show up as change. You can also choose both periods yourself.
@@ -39,7 +43,8 @@ The sidebar then shows how many images were found and roughly how much will be
 downloaded, before anything is downloaded. Press **Find changes**. Results are
 saved on your computer: the last map reopens instantly next time, and older
 ones are under **Saved maps**. The **sensitivity (α) slider** updates the map
-instantly.
+instantly. Switch between **Choose area** and **Change map** at the top of the
+page.
 
 ### Where the images come from
 

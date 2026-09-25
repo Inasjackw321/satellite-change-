@@ -73,3 +73,20 @@ def test_legend_date_span():
     assert _span(["2021-04-01", "2021-05-19"]) == "1 Apr – 19 May 2021"
     assert _span(["2021-12-20", "2022-01-05"]) == "20 Dec 2021 – 5 Jan 2022"
     assert _span(["2022-04-01"]) == "1 Apr 2022"
+
+
+def rectangle(w, s, e, n):
+    return {"type": "Feature", "properties": {},
+            "geometry": {"type": "Polygon", "coordinates": [[[w, s], [w, n], [e, n], [e, s], [w, s]]]}}
+
+
+def test_bounds_from_drawings_uses_the_newest_shape():
+    old, new = rectangle(30.1, 50.4, 30.2, 50.5), rectangle(30.3, 50.45, 30.41, 50.52)
+    assert inputs.bounds_from_drawings([old, new]) == (30.3, 50.45, 30.41, 50.52)
+    assert inputs.bounds_from_drawings([]) is None and inputs.bounds_from_drawings(None) is None
+
+
+def test_bounds_from_drawings_ignores_points_and_flat_shapes():
+    point = {"type": "Feature", "geometry": {"type": "Point", "coordinates": [30.1, 50.4]}}
+    assert inputs.bounds_from_drawings([point]) is None
+    assert inputs.bounds_from_drawings([rectangle(30.1, 50.4, 30.1, 50.5)]) is None
