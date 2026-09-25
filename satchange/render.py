@@ -1,6 +1,7 @@
 """Turn a downloaded change result into numbers and an interactive map."""
 
 import base64
+import datetime as dt
 import html
 import io
 from dataclasses import dataclass
@@ -47,6 +48,15 @@ def summarize(result, alpha):
     if result.null_hist is not None:
         null_rate = exceedance(result.null_hist, NULL_MAX / NULL_BINS, threshold)
     return Summary(alpha, threshold, km2(valid), km2(inc), km2(dec), null_rate)
+
+
+def _span(days):
+    """'1 Apr – 19 May 2021' for a list of ISO dates."""
+    first, last = (dt.date.fromisoformat(d) for d in (days[0], days[-1]))
+    if first == last:
+        return f"{first.day} {first:%b %Y}"
+    head = f"{first.day} {first:%b}" if first.year == last.year else f"{first.day} {first:%b %Y}"
+    return f"{head} – {last.day} {last:%b %Y}"
 
 
 def _hex_rgb(color):
@@ -109,9 +119,9 @@ def build_map(result, alpha, layers=None):
     <div style="position:fixed;bottom:24px;left:12px;z-index:9999;max-width:300px;
                 background:rgba(20,20,20,.85);color:#eee;padding:8px 10px;border-radius:6px;
                 font:12px/1.5 system-ui,sans-serif">
-      <b>{html.escape(p.label)}</b> · {result.before_days[0]} … {result.before_days[-1]}
-      &rarr; {result.after_days[0]} … {result.after_days[-1]}<br>
-      <span style="color:{DECREASE}">&#9632;</span> radar backscatter decrease &nbsp;
-      <span style="color:{INCREASE}">&#9632;</span> increase
+      <b>{html.escape(p.label)}</b><br>
+      Before: {_span(result.before_days)}<br>After: {_span(result.after_days)}<br>
+      <span style="color:{DECREASE}">&#9632;</span> radar signal decreased &nbsp;
+      <span style="color:{INCREASE}">&#9632;</span> increased
     </div>"""))
     return m

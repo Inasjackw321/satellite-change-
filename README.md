@@ -27,19 +27,35 @@ The first start takes a minute or two while it sets up a private Python
 environment in `.venv`. After that it starts in seconds. The app opens in your
 browser; close the launcher window to stop it.
 
-In the app:
+The sidebar walks you through four steps:
 
-1. The first time, click **Sign in with Google** and approve Earth Engine access.
-2. Enter your Cloud project in the sidebar.
-3. Press **Run analysis**. The defaults compare April–May 2021 with April–May
-   2022 over Kyiv and Irpin, Bucha and Hostomel, the same season a year apart.
-   The first run takes a few minutes. Results are saved in `cache/`, and the
-   last one reopens instantly next time.
-4. Use the **α slider** to trade sensitivity against false alarms. It updates
-   instantly without contacting Earth Engine.
+1. **Google account:** click **Sign in with Google**. Google's sign-in page
+   opens in your browser; approve access and the app updates by itself.
+2. **Cloud project:** pick your project from the list. If it isn't listed,
+   type its ID. There's a link to create a free Earth Engine project if you
+   don't have one.
+3. **Area:** Kyiv (city plus Irpin, Bucha and Hostomel) is built in. You can
+   also **search for any place by name** (using OpenStreetMap's place search)
+   or enter coordinates. Very small
+   areas are enlarged to at least 4 km across, and very large ones are trimmed
+   to fit a 10 m analysis.
+4. **Dates:** pick the date the changes happened before. The app compares the
+   weeks after that date with the same weeks one year earlier, so seasons don't
+   show up as change. You can also choose both periods yourself.
 
-Other areas: choose **Custom area…** and enter a bounding box, or add a preset
-to `CITIES` in `satchange/engine.py`.
+Then press **Find changes**. The first run takes a few minutes. Results are
+saved: the last map reopens instantly next time, and older ones are under
+**Saved maps**. The **sensitivity (α) slider** updates the map instantly.
+
+If something goes wrong (for example the project isn't registered for Earth
+Engine, or the Earth Engine API is switched off), the app says what to do and
+links to the right Google page.
+
+**Signing out:** click **Sign out** under "Google account" and confirm. This
+revokes the app's Google access token and deletes the sign-in from this
+computer. Earth Engine keeps one sign-in per computer, so other Earth Engine
+tools on this computer are signed out too. Your saved maps are kept; delete
+them under **Saved maps**. To switch accounts, sign out and sign in again.
 
 ## Reading the map
 
@@ -100,6 +116,8 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
 - `satchange/engine.py`: Earth Engine search, orbit choice, compositing,
   the 10 m tiled download, the no-change check, and the cache.
 - `satchange/render.py`: areas and the Leaflet map.
+- `satchange/account.py`: sign-in, sign-out, project list, friendly errors.
+- `satchange/inputs.py`: place search, area fitting, before/after periods.
 - `app.py`: the Streamlit UI. `launch.py`: the launcher.
 - `tests/`: Monte Carlo checks of the statistics, the whole Earth Engine
   pipeline against a fake server (graph built against the real API

@@ -11,7 +11,6 @@ import datetime as dt
 import hashlib
 import json
 import math
-import os
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -38,26 +37,6 @@ CITIES = {
     # that were fought over in February-March 2022.
     "Kyiv": (30.15, 50.20, 30.85, 50.62),
 }
-
-
-class NotSignedIn(Exception):
-    pass
-
-
-def has_credentials():
-    return os.path.exists(ee.oauth.get_credentials_path())
-
-
-def connect(project):
-    """Initialise Earth Engine, raising NotSignedIn if there are no credentials."""
-    if not has_credentials():
-        raise NotSignedIn()
-    ee.Initialize(project=project or None)
-
-
-def sign_in():
-    """Opens the Google sign-in page in the browser and stores credentials."""
-    ee.Authenticate(auth_mode="localhost")
 
 
 # --- Grid ---------------------------------------------------------------
@@ -355,6 +334,26 @@ def run(params, progress=lambda fraction, message: None, use_cache=True):
     result.save(cache)
     progress(1.0, "Done")
     return result
+
+
+def saved_results():
+    """[(path, description)] of cached results, newest first."""
+    out = []
+    for path in sorted(CACHE_DIR.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with np.load(path) as f:
+                meta = json.loads(str(f["meta"]))
+        except (OSError, ValueError, KeyError):
+            continue
+        saved = dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%d %b %Y")
+        out.append((path, f"{meta['params']['label']}: {meta['before_days'][0][:7]} → "
+                          f"{meta['after_days'][0][:7]} (saved {saved})"))
+    return out
+
+
+def delete_saved():
+    for path in CACHE_DIR.glob("*.npz"):
+        path.unlink(missing_ok=True)
 
 
 def display_layers(result):
