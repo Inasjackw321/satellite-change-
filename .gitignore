@@ -1,4 +1,6 @@
 __pycache__/
 .pytest_cache/
-*_change_map.html
 .venv/
+cache/
+config.json
+*_change_*.html
