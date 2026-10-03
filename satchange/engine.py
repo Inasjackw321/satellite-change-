@@ -279,34 +279,51 @@ def _boxcar(a, k):
 
 def estimate_enl(plan, grid, signer, bands, smooth=1, pairs=3, size=256):
     """ENL of single images after the speckle filter, from consecutive before
-    acquisitions sampled in four windows spread over the area. Returns None if
-    there's too little data."""
-    days = list(plan.all_before)[-(pairs + 1):]
+    acquisitions. Returns None if there's too little data."""
+    return measure_enl(plan.all_before, grid, signer, bands, smooth, pairs=pairs, size=size)
+
+
+def measure_enl(scenes_by_day, grid, signer, bands, smooth=1, span=False, pairs=3, size=192):
+    """ENL of single passes after the speckle filter, from the latest
+    consecutive passes, in nine windows spread over the area. With ``span``, of
+    the bands added together. Returns None if there's too little data.
+
+    Textured ground (buildings, fields) has fewer effective looks after
+    filtering than smooth ground (water, tarmac), so each window is measured
+    separately and the lowest value is used: the test is then calibrated for
+    the most textured part of the scene and only stricter elsewhere."""
+    days = sorted(scenes_by_day)[-(pairs + 1):]
     if len(days) < 2:
         return None
     s = min(size, grid.width, grid.height)
     m = smooth // 2
     windows = {(max(0, int(fx * grid.width) - s // 2), max(0, int(fy * grid.height) - s // 2))
-               for fx in (0.3, 0.7) for fy in (0.3, 0.7)}
-    samples = []
+               for fx in (0.2, 0.5, 0.8) for fy in (0.2, 0.5, 0.8)}
+    channels = ["span"] if span else bands
+    estimates = []
     for c, r in windows:
+        samples = []
         w, h = min(s, grid.width - c), min(s, grid.height - r)
         filtered = []
         for d in days:
-            img = _read(grid, plan.all_before[d], signer, bands, c, r, w, h)
-            valid = np.logical_and.reduce([np.isfinite(img[b]) for b in bands])
+            img = _read(grid, scenes_by_day[d], signer, bands, c, r, w, h)
+            if span:
+                img = {"span": sum(img[b] for b in bands)}
+            valid = np.logical_and.reduce([np.isfinite(img[b]) for b in channels])
             share = _boxcar(valid.astype(float), smooth)
             full = share > 1 - 1e-9  # only pixels whose whole window is valid
             if m:
                 full[:m], full[-m:], full[:, :m], full[:, -m:] = False, False, False, False
             filtered.append({b: np.where(full, _boxcar(np.where(valid, img[b], 0), smooth), np.nan)
-                             for b in bands})
+                             for b in channels})
         for a, b in zip(filtered, filtered[1:]):
-            for band in bands:
-                lr = np.log(a[band] / b[band])
+            for ch in channels:
+                lr = np.log(a[ch] / b[ch])
                 samples.append(lr[np.isfinite(lr)])
-    samples = np.concatenate(samples)
-    return stats.estimate_enl(samples) if samples.size >= 1000 else None
+        samples = np.concatenate(samples)
+        if samples.size >= 1000:
+            estimates.append(stats.estimate_enl(samples))
+    return min(estimates) if estimates else None
 
 
 def _scan(plan, grid, signer, bands, window, crop, smooth, enl):
@@ -481,20 +498,33 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
 # --- Saved results ------------------------------------------------------------
 
 def saved_results():
-    """[(path, description)] of cached results, newest first. Results saved by
-    older versions of the app are skipped."""
+    """[(path, description)] of cached results of both kinds, newest first.
+    Results saved by older versions of the app are skipped."""
+    from . import timeseries
+
     out = []
     for path in sorted(CACHE_DIR.glob("*.npz"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             with np.load(path) as f:
                 meta = json.loads(str(f["meta"]))
-            if meta.get("version") != CACHE_VERSION:
-                continue
         except (OSError, ValueError, KeyError):
             continue
-        p = meta["params"]
-        out.append((path, f"{p['label']}: {short_date(p['start'])} → {short_date(p['end'])}"))
+        p = meta.get("params", {})
+        if meta.get("kind") == "timeseries" and meta.get("version") == timeseries.VERSION:
+            what = "ships" if p["target"] == "water" else "activity"
+        elif "kind" not in meta and meta.get("version") == CACHE_VERSION:
+            what = "changes"
+        else:
+            continue
+        out.append((path, f"{p['label']}: {what}, {short_date(p['start'])} → {short_date(p['end'])}"))
     return out
+
+
+def load_result(path):
+    """A saved result of either kind."""
+    from . import timeseries
+
+    return (timeseries.TSResult if Path(path).name.startswith("ts_") else Result).load(path)
 
 
 def short_date(day):

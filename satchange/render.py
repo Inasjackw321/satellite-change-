@@ -249,3 +249,123 @@ def build_map(result, det, max_labels=300):
       <b>2</b> = times a change was seen there between satellite passes (hover for dates)
     </div>"""))
     return m
+
+
+# --- Activity and ships (time series) -------------------------------------------
+
+# Ordinal blue ramp (validated: one hue, monotone lightness, light end >= 2:1)
+# for "seen in 1 / 2 / 3-4 / 5+ passes".
+ACTIVITY_RAMP = ["#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]
+ACTIVITY_CLASSES = ["1 pass", "2 passes", "3–4 passes", "5+ passes"]
+SHIP_COLOR = "#eb6834"
+
+
+def activity_class(count):
+    """0 = none, 1..4 = index + 1 into ACTIVITY_RAMP."""
+    return np.select([count >= 5, count >= 3, count == 2, count == 1], [4, 3, 2, 1], 0)
+
+
+def activity_png(analysis, pass_index=None):
+    """Objects of one pass (pass_index) or how often each spot was busy."""
+    if pass_index is None:
+        cls = activity_class(analysis.count)
+    else:
+        cls = analysis.masks[pass_index].astype(np.uint8) * 3
+    rgba = np.zeros(cls.shape + (4,), np.uint8)
+    for k, color in enumerate(ACTIVITY_RAMP, 1):
+        rgba[cls == k] = _hex_rgb(color) + (235,)
+    any_ = cls > 0
+    rim = any_ & ~ndimage.binary_erosion(any_)
+    rgba[rim] = (255, 255, 255, 255)  # a light rim keeps spots visible on any background
+    return _png(Image.fromarray(rgba, "RGBA"))
+
+
+def pass_label(day):
+    return _day(day)
+
+
+def detection_tooltip(d):
+    kind = "Ship" if d.on_water else "Object"
+    return (f"<b>{kind}</b> · {_day(d.day)}<br>about {d.length_m:,.0f} m long, "
+            f"{d.area_m2:,.0f} m²<br>{d.brightness_db:+.0f} dB brighter than usual")
+
+
+def hotspot_tooltip(h):
+    days = ", ".join(_day(d) for d in h.days[:12]) + (" …" if len(h.days) > 12 else "")
+    return (f"<b>Something here in {h.seen} of {h.of} passes</b><br>"
+            f"typical size {h.area_m2:,.0f} m²<br>{days}")
+
+
+def hotspot_badge(h):
+    return (f'<div style="font:bold 11px/16px system-ui,sans-serif;white-space:nowrap;height:16px;'
+            f'padding:0 4px;border-radius:8px;background:#fff;color:#111;display:inline-block;'
+            f'border:2px solid {ACTIVITY_RAMP[2]};box-shadow:0 0 2px #000">{h.seen}/{h.of}</div>')
+
+
+def build_activity_map(result, analysis, pass_index=None, max_markers=600):
+    p = result.params
+    ships = p.target == "water"
+    (south, west), (north, east) = result.grid.latlon_bounds()
+    m = folium.Map(location=[(south + north) / 2, (west + east) / 2], zoom_start=12,
+                   tiles=None, control_scale=True)
+    folium.TileLayer(
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery", name="Satellite photo (Esri)",
+    ).add_to(m)
+    folium.TileLayer("OpenStreetMap", name="Street map", show=False).add_to(m)
+
+    f = 2  # pass images are stored at 20 m
+    if pass_index is not None:
+        img = result.pass_images[pass_index]
+        folium.raster_layers.ImageOverlay(
+            backscatter_png(img), name=f"Radar image {pass_label(result.days[pass_index])}",
+            bounds=result.grid.window_latlon(0, 0, img.shape[1] * f, img.shape[0] * f),
+            attr="Contains modified Copernicus Sentinel data",
+        ).add_to(m)
+    water = np.zeros(result.water.shape + (4,), np.uint8)
+    water[result.water] = (40, 120, 255, 70)
+    folium.raster_layers.ImageOverlay(_png(Image.fromarray(water, "RGBA")), bounds=[[south, west], [north, east]],
+                                      name="Water (found from the radar)", show=False).add_to(m)
+
+    if not ships or pass_index is not None:
+        folium.raster_layers.ImageOverlay(
+            activity_png(analysis, pass_index), bounds=[[south, west], [north, east]],
+            name="Objects" if pass_index is not None else "How often each spot was busy",
+            attr="Contains modified Copernicus Sentinel data (via Microsoft Planetary Computer)",
+        ).add_to(m)
+
+    marks = folium.FeatureGroup(name="Ships" if ships else "Labels").add_to(m)
+    shown = [d for d in analysis.detections if pass_index is None or d.pass_index == pass_index]
+    if ships or pass_index is not None:
+        for d in shown[:max_markers]:
+            folium.CircleMarker([d.lat, d.lon], radius=6, color="#ffffff", weight=2, fill=True,
+                                fill_color=SHIP_COLOR if d.on_water else ACTIVITY_RAMP[2], fill_opacity=0.95,
+                                tooltip=detection_tooltip(d)).add_to(marks)
+    else:
+        for h in analysis.hotspots[:max_markers]:
+            folium.Marker([h.lat, h.lon], tooltip=hotspot_tooltip(h),
+                          icon=folium.DivIcon(html=hotspot_badge(h), icon_size=(40, 20),
+                                              icon_anchor=(-6, 10))).add_to(marks)
+
+    w, s, e, n = p.bounds
+    folium.Rectangle([[s, w], [n, e]], name="Area analysed", fill=False, color="#ffffff", weight=1.5).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    m.fit_bounds([[s, w], [n, e]])
+
+    if pass_index is not None:
+        key = (f'<span style="color:{SHIP_COLOR if ships else ACTIVITY_RAMP[2]}">&#9679;</span> '
+               f'{"ship" if ships else "object"} seen on {pass_label(result.days[pass_index])} (hover for size)')
+    elif ships:
+        key = f'<span style="color:{SHIP_COLOR}">&#9679;</span> a ship in one pass (hover for date and size)'
+    else:
+        key = "Busy in: " + " ".join(f'<span style="color:{c}">&#9632;</span> {t}'
+                                     for c, t in zip(ACTIVITY_RAMP, ACTIVITY_CLASSES))
+        key += "<br><b>3/12</b> = something there in 3 of 12 passes (hover for dates)"
+    m.get_root().html.add_child(folium.Element(f"""
+    <div style="position:fixed;bottom:48px;left:12px;z-index:9999;max-width:330px;
+                background:rgba(20,20,20,.85);color:#eee;padding:8px 10px;border-radius:6px;
+                font:12px/1.5 system-ui,sans-serif">
+      <b>{html.escape(p.label)}</b><br>
+      {len(result.days)} passes, {_span(result.days)}<br>{key}
+    </div>"""))
+    return m

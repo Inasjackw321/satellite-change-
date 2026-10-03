@@ -74,3 +74,21 @@ def test_decode():
     np.testing.assert_array_equal(valid, [[False, True, True, True]])
     np.testing.assert_allclose(stat[0, 1:], [0, 12.34, 9.5], rtol=1e-6)
     np.testing.assert_array_equal(increased[0, 1:], [False, True, False])
+
+
+@pytest.mark.parametrize("looks,n_others", [(4.4, 11), (35.0, 6), (20.0, 2)])
+@pytest.mark.parametrize("alpha", [1e-2, 1e-3])
+def test_pass_threshold_matches_simulation(looks, n_others, alpha):
+    """One pass against the lower median of the other passes, all speckle."""
+    from satchange.stats import median_rank, pass_threshold_db
+
+    rng = np.random.default_rng(6)
+    n = 1_000_000
+    one = rng.gamma(looks, 1 / looks, n)
+    ref = np.sort(rng.gamma(looks, 1 / looks, (n_others, n)), axis=0)[median_rank(n_others) - 1]
+    ratio_db = 10 * np.log10(one / ref)
+    hi = pass_threshold_db(alpha, looks, n_others)
+    lo = pass_threshold_db(alpha, looks, n_others, brighter=False)
+    assert hi > 0 > lo
+    assert np.mean(ratio_db > hi) == pytest.approx(alpha, rel=0.1)
+    assert np.mean(ratio_db < lo) == pytest.approx(alpha, rel=0.1)

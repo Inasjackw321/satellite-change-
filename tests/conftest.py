@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import rasterio
 from affine import Affine
-from rasterio.warp import transform_bounds
+from rasterio.warp import transform, transform_bounds
 
 from satchange import engine, source
 
@@ -21,9 +21,28 @@ PATCH = (30.225, 50.515, 30.235, 50.522)  # changed once after the event, ~700 x
 # "Aircraft coming and going": 10 dB brighter on these passes only.
 ACTIVITY = (30.245, 50.528, 30.250, 50.531)  # ~350 x 330 m
 UTM = "EPSG:32636"
+CRS_LONLAT = "EPSG:4326"
 # An image every 6 days; the patch changes after 4 July 2026.
 DAYS = [dt.date(2026, 5, 29) + dt.timedelta(days=6 * k) for k in range(12)]  # 29 May .. 3 Aug
 EVENT = dt.date(2026, 7, 4)
+# A strip of water along the west side, with a ship (80 m x 30 m) sailing north
+# on some passes. Not on the passes the two-date comparison tests use.
+WATER = (30.195, 50.49, 30.214, 50.55)
+SHIP_DAYS = [dt.date(2026, 5, 29), dt.date(2026, 6, 4), dt.date(2026, 6, 10),
+             dt.date(2026, 6, 16), dt.date(2026, 7, 10), dt.date(2026, 7, 16)]
+SHIP_LON = 30.207
+
+
+# Aircraft stands (50 m x 50 m, +13 dB when occupied), also only on passes the
+# two-date comparison tests don't use.
+STANDS = {
+    "A": ((50.508, 30.252), [dt.date(2026, 5, 29), dt.date(2026, 6, 10), dt.date(2026, 7, 10)]),
+    "B": ((50.536, 30.238), [dt.date(2026, 6, 16)]),
+}
+
+
+def ship_position(day):
+    return 50.506 + 0.005 * SHIP_DAYS.index(day), SHIP_LON  # lat, lon
 ACTIVE_DAYS = {dt.date(2026, 7, 22), dt.date(2026, 8, 3)}
 
 
@@ -47,12 +66,17 @@ class Archive:
         self.mean = {"VV": 10 ** self.rng.uniform(-2, 0, (self.height, self.width)),
                      "VH": 10 ** self.rng.uniform(-2.8, -0.8, (self.height, self.width))}
         self.patch, self.activity = self._pixels(PATCH), self._pixels(ACTIVITY)
+        water = self._pixels(WATER)
+        self.mean["VV"][water] = 10 ** -2.2  # -22 dB, calm water
+        self.mean["VH"][water] = 10 ** -2.9
         self.scenes = []
         for day in DAYS:
             # One pass is split into two scenes, like real slices.
             halves = ([(0, self.height // 2), (self.height // 2, self.height)]
                       if day == dt.date(2026, 6, 22) else [(0, self.height)])
-            images = self._acquire(changed=day > EVENT, busy=day in ACTIVE_DAYS)
+            images = self._acquire(changed=day > EVENT, busy=day in ACTIVE_DAYS,
+                                   ship=ship_position(day) if day in SHIP_DAYS else None,
+                                   aircraft=[pos for pos, days in STANDS.values() if day in days])
             for k, (r0, r1) in enumerate(halves):
                 self.scenes.append(self._write(day, k, images, r0, r1, orbit=36))
             # A second orbit that only covers the western third.
@@ -62,9 +86,13 @@ class Archive:
         w, s, e, n = transform_bounds("EPSG:4326", UTM, *bounds)
         cols = ((w - self.transform.c) / 10, (e - self.transform.c) / 10)
         rows = ((self.transform.f - n) / 10, (self.transform.f - s) / 10)
-        return slice(int(rows[0]), int(rows[1])), slice(int(cols[0]), int(cols[1]))
+        return slice(max(0, int(rows[0])), int(rows[1])), slice(max(0, int(cols[0])), int(cols[1]))
 
-    def _acquire(self, changed, busy=False):
+    def _cell(self, lat, lon):
+        x, y = transform(CRS_LONLAT, UTM, [lon], [lat])
+        return int((self.transform.f - y[0]) / 10), int((x[0] - self.transform.c) / 10)
+
+    def _acquire(self, changed, busy=False, ship=None, aircraft=()):
         out = {}
         for b, mean in self.mean.items():
             m = mean.copy()
@@ -72,6 +100,12 @@ class Archive:
                 m[self.patch] *= 10 ** -0.7  # -7 dB
             if busy:
                 m[self.activity] *= 10  # +10 dB
+            if ship:
+                row, col = self._cell(*ship)
+                m[row - 4:row + 4, col - 1:col + 2] = 1.0 if b == "VV" else 0.2  # bright hull
+            for lat, lon in aircraft:
+                row, col = self._cell(lat, lon)
+                m[row - 2:row + 3, col - 2:col + 3] *= 20  # +13 dB
             out[b] = (self.rng.gamma(TRUE_ENL, 1 / TRUE_ENL, m.shape) * m).astype(np.float32)
         return out
 

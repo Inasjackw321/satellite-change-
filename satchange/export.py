@@ -179,6 +179,50 @@ def _nice_length(metres):
     return 100000
 
 
+def _scale_bar(d, x, y, width, metres_per_px, k):
+    length = _nice_length(width * 0.15 * metres_per_px)
+    bar = length / metres_per_px
+    d.rectangle((x, y, x + bar, y + 8 * k), fill="black")
+    d.rectangle((x + bar / 2, y + 1, x + bar - 1, y + 8 * k - 1), fill="white")
+    label = f"{length // 1000} km" if length >= 1000 else f"{length} m"
+    d.text((x + bar + 10 * k, y + 4 * k), label, fill="black", font=_font(16 * k), anchor="lm")
+
+
+def _credits(d, panel, satellite, k):
+    credits = SENTINEL_CREDIT + (f"   ·   {ESRI_CREDIT}" if satellite else "")
+    tiny = _font(13 * k)
+    d.text((30 * k, panel.height - 16 * k), _text(tiny, credits), fill=(110, 110, 110), font=tiny, anchor="ld")
+
+
+def _metres_per_px(grid, factor):
+    lat = (grid.latlon_bounds()[0][0] + grid.latlon_bounds()[1][0]) / 2
+    return grid.scale * math.cos(math.radians(lat)) / factor
+
+
+def _background(result, grid, size, background, fetch, radar):
+    """(image, note, satellite?)"""
+    if background == "satellite":
+        try:
+            return satellite_background(grid, size, fetch), None, True
+        except Exception:
+            return radar(), "Couldn't download the satellite photo, so the radar image is used.", False
+    return radar(), None, False
+
+
+def _finish(img, panel, watermark, fmt):
+    draw_north_arrow(img)
+    img = draw_watermark(img, watermark)
+    out = Image.new("RGB", (img.width, img.height + panel.height), "white")
+    out.paste(img, (0, 0))
+    out.paste(panel, (0, img.height))
+    buf = io.BytesIO()
+    if fmt.upper() in ("JPG", "JPEG"):
+        out.save(buf, format="JPEG", quality=90)
+    else:
+        out.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def legend_panel(result, det_name, det, summary, width, metres_per_px, satellite):
     p = result.params
     k = width / 1400
@@ -211,17 +255,8 @@ def legend_panel(result, det_name, det, summary, width, metres_per_px, satellite
            fill="black", font=mid, anchor="lm")
     y2 += 44 * k
 
-    # Scale bar
-    length = _nice_length(width * 0.15 * metres_per_px)
-    bar = length / metres_per_px
-    d.rectangle((x2, y2, x2 + bar, y2 + 8 * k), fill="black")
-    d.rectangle((x2 + bar / 2, y2 + 1, x2 + bar - 1, y2 + 8 * k - 1), fill="white")
-    label = f"{length // 1000} km" if length >= 1000 else f"{length} m"
-    d.text((x2 + bar + 10 * k, y2 + 4 * k), label, fill="black", font=small, anchor="lm")
-
-    credits = SENTINEL_CREDIT + (f"   ·   {ESRI_CREDIT}" if satellite else "")
-    tiny = _font(13 * k)
-    d.text((30 * k, panel.height - 16 * k), _text(tiny, credits), fill=(110, 110, 110), font=tiny, anchor="ld")
+    _scale_bar(d, x2, y2, width, metres_per_px, k)
+    _credits(d, panel, satellite, k)
     return panel
 
 
@@ -231,37 +266,15 @@ def export_image(result, det, det_name="Balanced", background="satellite", water
     couldn't be downloaded and the radar image was used instead."""
     grid = result.grid
     size, factor = map_size(grid)
-    note = None
-    if background == "satellite":
-        try:
-            base = satellite_background(grid, size, fetch)
-        except Exception:
-            base, note = radar_background(result, size), "Couldn't download the satellite photo, so the radar image is used."
-    else:
-        base = radar_background(result, size)
-    satellite = background == "satellite" and note is None
-
+    base, note, satellite = _background(result, grid, size, background, fetch,
+                                        lambda: radar_background(result, size))
     found = render.detect(result.signed, result.change_db, det, len(result.params.bands))
     img = draw_changes(base, found, size)
     if numbers:
         draw_numbers(img, render.find_spots(result, found), factor)
-    draw_north_arrow(img)
-    img = draw_watermark(img, watermark)
-
-    lat = (grid.latlon_bounds()[0][0] + grid.latlon_bounds()[1][0]) / 2
-    metres_per_px = grid.scale * math.cos(math.radians(lat)) / factor
     panel = legend_panel(result, det_name, det, render.summarize(result, det), size[0],
-                         metres_per_px, satellite)
-    out = Image.new("RGB", (size[0], size[1] + panel.height), "white")
-    out.paste(img, (0, 0))
-    out.paste(panel, (0, size[1]))
-
-    buf = io.BytesIO()
-    if fmt.upper() in ("JPG", "JPEG"):
-        out.save(buf, format="JPEG", quality=90)
-    else:
-        out.save(buf, format="PNG", optimize=True)
-    return buf.getvalue(), note
+                         _metres_per_px(grid, factor), satellite)
+    return _finish(img, panel, watermark, fmt), note
 
 
 def spots_csv(result, det):
@@ -271,4 +284,165 @@ def spots_csv(result, det):
     for s in render.find_spots(result, found):
         lines.append(f"{s.lat:.6f},{s.lon:.6f},{s.area_m2:.0f},{s.change_db:.2f},"
                      f"{'decrease' if s.change_db < 0 else 'increase'},{s.times},\"{'; '.join(s.when)}\"")
+    return "\n".join(lines) + "\n"
+
+
+# --- Activity and ships ------------------------------------------------------------
+
+def pass_background(result, size, pass_index=None):
+    """Radar image of one pass, or the average of all passes."""
+    imgs = result.pass_images
+    if pass_index is not None:
+        img = imgs[pass_index]
+    else:
+        valid = imgs > 0
+        img = (imgs.sum(axis=0, dtype=np.float32) / np.maximum(valid.sum(axis=0), 1)).astype(np.uint8)
+    f = 2  # pass images are at 20 m
+    box = (0, 0, result.grid.width / f, result.grid.height / f)
+    return Image.fromarray(img, "L").resize(size, Image.BILINEAR, box=box).convert("RGB")
+
+
+def draw_activity(base, analysis, size, pass_index=None):
+    out = np.asarray(base, dtype=np.float32).copy()
+    if pass_index is None:
+        cls = render.activity_class(analysis.count)
+    else:
+        cls = analysis.masks[pass_index].astype(np.uint8) * 3
+    for k, color in enumerate(render.ACTIVITY_RAMP, 1):
+        m = _resize_mask(cls == k, size)
+        out[m] = out[m] * 0.15 + np.array(render._hex_rgb(color)) * 0.85
+    any_ = _resize_mask(cls > 0, size)
+    out[any_ & ~ndimage.binary_erosion(any_)] = 255  # light rim
+    return Image.fromarray(out.clip(0, 255).astype(np.uint8))
+
+
+def draw_ships(img, detections, factor):
+    draw = ImageDraw.Draw(img)
+    r = max(6, img.width / 150)
+    color = render._hex_rgb(render.SHIP_COLOR)
+    for d in detections:
+        x, y = (d.col + 0.5) * factor, (d.row + 0.5) * factor
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=color, outline="white", width=max(2, int(r / 3)))
+
+
+def draw_hotspot_labels(img, hotspots, factor, max_labels=MAX_LABELS):
+    draw = ImageDraw.Draw(img)
+    font = _font(img.width / 55, bold=True)
+    placed = []
+    for h in hotspots[:max_labels]:
+        x, y = (h.col + 0.5) * factor + 8, (h.row + 0.5) * factor
+        if any(abs(x - px) < 3 * font.size and abs(y - py) < 1.6 * font.size for px, py in placed):
+            continue
+        placed.append((x, y))
+        _badge(draw, x, y, f"{h.seen}/{h.of}", render._hex_rgb(render.ACTIVITY_RAMP[2]), font)
+
+
+def _timeline(d, x, y, w, h, result, analysis, k, highlight=None, noun="Objects"):
+    """Objects per pass as small bars, first and last date under them."""
+    counts = analysis.per_pass
+    top = max(max(counts), 1)
+    n = len(counts)
+    gap = max(1, w / n * 0.25)
+    bar_w = (w - gap * (n - 1)) / n
+    color = render._hex_rgb(render.ACTIVITY_RAMP[1])
+    for i, c in enumerate(counts):
+        bx = x + i * (bar_w + gap)
+        bh = h * c / top
+        fill = render._hex_rgb(render.SHIP_COLOR) if i == highlight else color
+        if bh:
+            d.rectangle((bx, y + h - bh, bx + bar_w, y + h), fill=fill)
+    d.line((x, y + h, x + w, y + h), fill=(170, 170, 170), width=1)
+    small = _font(13 * k)
+    d.text((x, y + h + 4 * k), _text(small, render._day(result.days[0])), fill=(90, 90, 90), font=small)
+    d.text((x + w, y + h + 4 * k), _text(small, render._day(result.days[-1])), fill=(90, 90, 90),
+           font=small, anchor="ra")
+    d.text((x, y - 6 * k), _text(small, f"{noun} per pass (most: {max(counts)})"), fill=(90, 90, 90),
+           font=small, anchor="ld")
+
+
+def activity_legend(result, analysis, sens_name, width, metres_per_px, satellite, pass_index=None):
+    p = result.params
+    ships = p.target == "water"
+    k = width / 1400
+    big, mid, small = _font(34 * k, bold=True), _font(20 * k), _font(16 * k)
+    panel = Image.new("RGB", (width, int(300 * k)), "white")
+    d = ImageDraw.Draw(panel)
+    x, y = 30 * k, 22 * k
+    d.text((x, y), p.label, fill="black", font=big)
+    y += 48 * k
+    what = "Ships" if ships else "Activity"
+    when = (render._day(result.days[pass_index]) if pass_index is not None
+            else f"{render._day(result.days[0])} → {render._day(result.days[-1])}")
+    d.text((x, y), _text(mid, f"{what} seen by radar, {when}"), fill="black", font=mid)
+    y += 32 * k
+    total = len(analysis.detections) if pass_index is None else analysis.per_pass[pass_index]
+    noun = "ship detection" if ships else "object"
+    line = f"{total:,} {noun}{'s' if total != 1 else ''}"
+    if pass_index is None:
+        line += f" in {len(result.days)} passes"
+        if not ships:
+            line += f"   ·   {len(analysis.hotspots):,} busy spots"
+    d.text((x, y), _text(small, line), fill=(70, 70, 70), font=small)
+    y += 26 * k
+    d.text((x, y), _text(small, f"Detection: {sens_name}"), fill=(70, 70, 70), font=small)
+    _timeline(d, x, y + 56 * k, width * 0.45, 56 * k, result, analysis, k, highlight=pass_index,
+              noun="Ships" if ships else "Objects")
+
+    x2, y2 = width * 0.56, 26 * k
+    sq = 20 * k
+    if ships or pass_index is not None:
+        color = render._hex_rgb(render.SHIP_COLOR if ships else render.ACTIVITY_RAMP[2])
+        d.ellipse((x2, y2, x2 + sq, y2 + sq), fill=color, outline="white")
+        d.text((x2 + sq + 12 * k, y2 + sq / 2),
+               "A ship in one pass" if ships else "Object present in this pass", fill="black",
+               font=mid, anchor="lm")
+        y2 += 40 * k
+    else:
+        d.text((x2, y2 + sq / 2), "Something there in:", fill="black", font=mid, anchor="lm")
+        y2 += 32 * k
+        for color, label in zip(render.ACTIVITY_RAMP, render.ACTIVITY_CLASSES):
+            d.rectangle((x2, y2, x2 + sq, y2 + sq), fill=render._hex_rgb(color), outline="white")
+            d.text((x2 + sq + 10 * k, y2 + sq / 2), _text(small, label), fill="black", font=small, anchor="lm")
+            x2 += 140 * k
+        x2 = width * 0.56
+        y2 += 36 * k
+        _badge(d, x2, y2 + sq / 2, "3/12", render._hex_rgb(render.ACTIVITY_RAMP[2]), _font(15 * k, bold=True))
+        d.text((x2 + 62 * k, y2 + sq / 2), _text(mid, "= seen in 3 of 12 passes"), fill="black",
+               font=mid, anchor="lm")
+        y2 += 44 * k
+    _scale_bar(d, x2, y2, width, metres_per_px, k)
+    _credits(d, panel, satellite, k)
+    return panel
+
+
+def export_activity_image(result, analysis, sens_name="Balanced", pass_index=None, background="satellite",
+                          watermark="@Kaldockhi", numbers=True, fmt="PNG", fetch=fetch_tile):
+    grid = result.grid
+    size, factor = map_size(grid)
+    base, note, satellite = _background(result, grid, size, background, fetch,
+                                        lambda: pass_background(result, size, pass_index))
+    ships = result.params.target == "water"
+    img = base if ships and pass_index is None else draw_activity(base, analysis, size, pass_index)
+    if ships or pass_index is not None:
+        draw_ships(img, [d for d in analysis.detections if pass_index is None or d.pass_index == pass_index],
+                   factor)
+    elif numbers:
+        draw_hotspot_labels(img, analysis.hotspots, factor)
+    panel = activity_legend(result, analysis, sens_name, size[0], _metres_per_px(grid, factor),
+                            satellite, pass_index)
+    return _finish(img, panel, watermark, fmt), note
+
+
+def detections_csv(analysis):
+    lines = ["date,latitude,longitude,length_m,area_m2,brightness_db,on_water"]
+    for d in analysis.detections:
+        lines.append(f"{d.day},{d.lat:.6f},{d.lon:.6f},{d.length_m:.0f},{d.area_m2:.0f},"
+                     f"{d.brightness_db:.1f},{'yes' if d.on_water else 'no'}")
+    return "\n".join(lines) + "\n"
+
+
+def hotspots_csv(analysis):
+    lines = ["latitude,longitude,passes_seen,passes_covered,typical_area_m2,dates"]
+    for h in analysis.hotspots:
+        lines.append(f"{h.lat:.6f},{h.lon:.6f},{h.seen},{h.of},{h.area_m2:.0f},\"{'; '.join(h.days)}\"")
     return "\n".join(lines) + "\n"
