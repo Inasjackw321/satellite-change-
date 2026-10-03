@@ -26,9 +26,6 @@ factor, which brings the false alarm rate back to ``alpha``.
 Everything is computed locally with NumPy at full 10 m resolution.
 """
 
-import functools
-import warnings
-
 import numpy as np
 from scipy import optimize, stats
 
@@ -108,54 +105,3 @@ def decode(signed):
     valid = signed != NODATA
     stat = np.abs(signed.astype(np.float32)) / STAT_SCALE
     return stat, signed > 0, valid
-
-
-# --- One pass against the usual state ------------------------------------------
-#
-# For monitoring activity, each pass is compared with the "usual" state of the
-# pixel: the lower median of the other passes of the same orbit (the k-th
-# smallest of n others, k = ceil(n / 2)). A median ignores objects that are
-# only there some of the time, which a mean would not.
-#
-# With every pass Gamma(L) distributed with the same mean, the reference is an
-# order statistic: its CDF value U = F(ref) follows Beta(k, n - k + 1). So
-#
-#   P(pass / ref > t) = E_U[ Q(L, L * t * F^-1(U)) ]
-#
-# which is integrated numerically; this gives exact thresholds, also far out
-# in the tail where simulation would need billions of samples.
-
-def median_rank(n_others):
-    """Rank (1-based) of the lower median among n_others values."""
-    return (n_others + 1) // 2
-
-
-def _exceed(t, looks, n_others, brighter):
-    from scipy import integrate, special
-
-    k = median_rank(n_others)
-    beta = stats.beta(k, n_others - k + 1)
-
-    def integrand(u):
-        ref = special.gammaincinv(looks, u) / looks  # reference value with CDF u (mean 1)
-        tail = special.gammaincc if brighter else special.gammainc
-        return tail(looks, looks * t * ref) * beta.pdf(u)
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", integrate.IntegrationWarning)  # roundoff far in the tail
-        value, _ = integrate.quad(integrand, 0, 1, limit=200, epsabs=0, epsrel=1e-7,
-                                  points=[beta.ppf(q) for q in (1e-6, 1e-3, 0.5)])
-    return max(value, 1e-300)
-
-
-@functools.lru_cache(maxsize=256)
-def pass_threshold_db(alpha, looks, n_others, brighter=True):
-    """dB by which one pass must exceed (or fall below) the lower median of
-    ``n_others`` other passes so that the chance of it happening by speckle
-    alone is ``alpha``. Positive for brighter, negative for darker."""
-    if not 0 < alpha < 0.5:
-        raise ValueError(f"alpha must be in (0, 0.5), got {alpha}")
-    looks = round(float(looks), 1)
-    f = lambda log_t: np.log(_exceed(np.exp(log_t), looks, n_others, brighter)) - np.log(alpha)
-    lo, hi = (0.0, np.log(1e5)) if brighter else (np.log(1e-5), 0.0)
-    return float(10 * optimize.brentq(f, lo, hi, xtol=1e-6) / np.log(10))

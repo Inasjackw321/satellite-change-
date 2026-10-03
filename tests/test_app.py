@@ -41,32 +41,22 @@ def app(offline, monkeypatch, tmp_path):
     import streamlit as st
     st.cache_data.clear()
     monkeypatch.setenv("SATCHANGE_CONFIG", str(tmp_path / "config.json"))
-    at = AppTest.from_file(APP, default_timeout=90)
-    at.session_state["mode"] = "compare"  # most tests here are about the two-date comparison
-    return at
+    return AppTest.from_file(APP, default_timeout=60)
 
 
 def button(at, label):
     return next(b for b in at.button if b.label == label)
 
 
-def mode(at):
-    return at.session_state["mode"]
-
-
-def area_box(at):
-    return at.sidebar.selectbox(key=f"area_{mode(at)}")
-
-
 def set_dates(at, start="2026-07-04", end="2026-08-04"):
-    at.sidebar.date_input(key=f"start_{mode(at)}").set_value(start)
-    at.sidebar.date_input(key=f"end_{mode(at)}").set_value(end)
+    at.sidebar.date_input(key="start").set_value(start)
+    at.sidebar.date_input(key="end").set_value(end)
     at.run()
 
 
-def choose_test_area(at, start="2026-07-04", end="2026-08-04"):
-    set_dates(at, start, end)
-    area_box(at).set_value("Enter coordinates…").run()
+def choose_test_area(at):
+    set_dates(at)
+    at.sidebar.selectbox[0].set_value("Enter coordinates…").run()
     w, s, e, n = conftest.AOI
     for label, v in (("West", w), ("East", e), ("South", s), ("North", n)):
         next(x for x in at.sidebar.number_input if x.label.startswith(label)).set_value(v)
@@ -188,14 +178,14 @@ def test_drawing_a_box_sets_the_area(app, monkeypatch):
     app.run()
     set_dates(app)
     assert not app.exception
-    assert area_box(app).value == "Drawn on the map"
+    assert app.sidebar.selectbox[0].value == "Drawn on the map"
     assert any("**Before:** 22 Jun" in i.value for i in app.sidebar.info)
     # The picker map now shows the drawn box, with the draw tool.
     html = drawn[-1].get_root().render()
     assert "L.Control.Draw" in html and f"{n}" in html
     button(app, "Find changes").click().run()
     assert not app.exception and "My area" in app.header[0].value
-    assert app.radio(key="view").value == "🗺️ Results"
+    assert app.radio[0].value == "🗺️ Change map"
 
 
 def test_view_switch_returns_to_the_area_picker(app, monkeypatch):
@@ -204,8 +194,8 @@ def test_view_switch_returns_to_the_area_picker(app, monkeypatch):
     monkeypatch.setattr(streamlit_folium, "st_folium", lambda m, **kw: calls.append(kw) or None)
     app.session_state["result"] = synthetic_result()
     app.run()
-    assert app.radio(key="view").value == "🗺️ Results" and not calls
-    app.radio(key="view").set_value("✏️ Choose area").run()
+    assert app.radio[0].value == "🗺️ Change map" and not calls
+    app.radio[0].set_value("✏️ Choose area").run()
     assert not app.exception and calls and calls[-1]["key"] == "area_picker"
 
 
@@ -217,9 +207,8 @@ def test_drawn_box_is_remembered_next_time(app, monkeypatch, tmp_path):
     app.run()
     monkeypatch.setattr(streamlit_folium, "st_folium", lambda m, **kw: None)
     fresh = AppTest.from_file(APP, default_timeout=60)
-    fresh.session_state["mode"] = "compare"
     fresh.run()
-    area_box(fresh).set_value("Drawn on the map").run()
+    fresh.sidebar.selectbox[0].set_value("Drawn on the map").run()
     assert any("About 19 km²" in c.value for c in fresh.sidebar.caption)
 
 
@@ -238,52 +227,3 @@ def test_download_box_makes_a_watermarked_image(app):
     # Changing a setting asks for a new image.
     app.text_input(key="export_watermark").set_value("@someone").run()
     assert any("press **Create image** again" in c.value for c in app.caption)
-
-
-# --- Activity and ships ---------------------------------------------------------
-
-def test_welcome_offers_the_three_modes(app):
-    app.session_state["mode"] = "activity"
-    app.run()
-    assert not app.exception
-    assert [b.label for b in app.button if b.key and b.key.startswith("pick_")] == ["Choose"] * 3
-    app.button(key="pick_ships").click().run()
-    assert app.session_state["mode"] == "ships"
-    assert area_box(app).options[0] == "Odesa port"
-
-
-def test_activity_end_to_end(app):
-    app.session_state["mode"] = "activity"
-    app.run()
-    choose_test_area(app, "2026-05-29", "2026-08-04")
-    info = " ".join(i.value for i in app.sidebar.info)
-    assert "**12 passes**" in info and "download about" in info.lower()
-    button(app, "Find activity").click().run()
-    assert not app.exception and not app.error
-    assert "My area: activity, 29 May 2026 → 3 Aug 2026" in app.header[0].value
-    metrics = {m.label: m.value for m in app.metric}
-    assert metrics["Objects seen"] == "4" and metrics["Busy spots"] == "2" and metrics["Passes"] == "12"
-    assert len(app.get("vega_lite_chart")) == 1  # the timeline
-
-    # Step to one pass: stand A's first visit.
-    app.radio(key="ts_view").set_value("One pass").run()
-    app.select_slider(key="ts_pass").set_value(0).run()
-    assert not app.exception
-
-    app.radio(key="export_background").set_value("Radar image").run()  # no internet in tests
-    button(app, "Create image").click().run()
-    labels = [b.label for b in app.get("download_button")]
-    assert "Download image (PNG)" in labels and "Every detection (CSV)" in labels
-    assert "Busy spots (CSV)" in labels
-
-
-def test_ships_end_to_end(app):
-    app.session_state["mode"] = "ships"
-    app.run()
-    choose_test_area(app, "2026-05-29", "2026-08-04")
-    button(app, "Find ships").click().run()
-    assert not app.exception and not app.error
-    assert "ships" in app.header[0].value
-    metrics = {m.label: m.value for m in app.metric}
-    assert metrics["Ship detections"] == "6" and metrics["Busiest pass"] == "29 May 2026"
-    assert app.session_state["result"].params.smooth == 1  # ships at full 10 m detail

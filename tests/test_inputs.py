@@ -50,7 +50,7 @@ def test_saved_results_lists_and_deletes(monkeypatch, tmp_path):
     (tmp_path / "broken.npz").write_bytes(b"not a zip")
     saved = engine.saved_results()
     assert [p.name for p, _ in saved] == ["a.npz"]
-    assert saved[0][1] == "Testville: changes, 4 Jul 2026 → 4 Aug 2026"
+    assert saved[0][1] == "Testville: 4 Jul 2026 → 4 Aug 2026"
     engine.delete_saved()
     assert engine.saved_results() == []
 
