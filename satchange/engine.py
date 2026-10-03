@@ -28,7 +28,20 @@ EARTH_RADIUS = 6378137.0
 GROUND_RES = 10.0  # metres, Sentinel-1 pixel spacing
 TILE = 1024
 DISPLAY_FACTOR = 4  # before/after background layers at 40 m
-LOOKBACK_DAYS = 90  # how far before the start date to look for images
+MAX_IMAGES = 20  # per side
+# A pass-to-pass change history per pixel, one bit per consecutive pair of passes.
+EVENT_TYPES = (np.uint16, np.uint32, np.uint64)
+
+
+def lookback_days(images):
+    """How far before the start date to look for images: enough for ``images``
+    passes even where a track is only revisited every 12 days."""
+    return max(90, 30 + 12 * images)
+
+
+def events_dtype(n_passes):
+    """Smallest unsigned integer type with a bit per consecutive pair of passes."""
+    return next(t for t in EVENT_TYPES if n_passes - 1 <= np.iinfo(t).bits)
 BYTES_PER_PIXEL = 3.2  # compressed float32 speckle, per band, for download estimates
 MAX_PIXELS = 30e6  # ~3,000 km2 at 10 m
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
@@ -119,7 +132,7 @@ class Params:
     bounds: tuple  # (west, south, east, north)
     start: str  # YYYY-MM-DD
     end: str
-    images: int = 3  # images averaged on each side
+    images: int = 3  # images averaged on each side (1 = compare just one image with one image)
     smooth: int = 3  # speckle filter window in pixels (1 = none)
     orbit_pass: str | None = None  # "ASCENDING" / "DESCENDING"
     orbit: int | None = None
@@ -129,7 +142,8 @@ class Params:
     @property
     def before_window(self):
         start = dt.date.fromisoformat(self.start)
-        return str(start - dt.timedelta(days=LOOKBACK_DAYS)), str(start + dt.timedelta(days=1))
+        return (str(start - dt.timedelta(days=lookback_days(self.images))),
+                str(start + dt.timedelta(days=1)))
 
     @property
     def after_window(self):
@@ -167,7 +181,7 @@ class Result:
     orbits: list = field(default_factory=list)
     null_signed: np.ndarray | None = None  # same, for before-vs-before (no-change check)
     null_db: np.ndarray | None = None
-    events: np.ndarray | None = None  # uint16 bitmask: bit i = change between pass i and i + 1
+    events: np.ndarray | None = None  # bitmask: bit i = change between pass i and i + 1
     before_db: np.ndarray | None = None  # uint8 VV backscatter at 40 m, 0 = no data
     after_db: np.ndarray | None = None
     version: int = CACHE_VERSION
@@ -319,7 +333,8 @@ def _scan(plan, grid, signer, bands, window, crop, smooth, enl):
     n_before = len(plan.before)
     sums = [{b: np.zeros((h, w)) for b in bands} for _ in range(3)]
     counts = [np.zeros((h, w)) for _ in range(3)]
-    events = np.zeros((crop[0].stop - crop[0].start, crop[1].stop - crop[1].start), np.uint16)
+    dtype = events_dtype(len(days))
+    events = np.zeros((crop[0].stop - crop[0].start, crop[1].stop - crop[1].start), dtype)
     previous = None
     for i, day in enumerate(days):
         img = _read(grid, (plan.before if i < n_before else plan.after)[day], signer, bands, c, r, w, h)
@@ -332,7 +347,7 @@ def _scan(plan, grid, signer, bands, window, crop, smooth, enl):
         current = ({b: _boxcar(filled[b], smooth)[crop] for b in bands},
                    _boxcar(valid.astype(float), smooth)[crop], valid[crop])
         if previous is not None:
-            events |= _pass_change(previous, current, bands, enl).astype(np.uint16) << (i - 1)
+            events |= _pass_change(previous, current, bands, enl).astype(dtype) << dtype(i - 1)
         previous = current
     return sums, counts, events
 
@@ -397,7 +412,7 @@ def process_tile(tile, plan, grid, signer, bands, enl, smooth=1):
                                               bands, enl, smooth, crop)
 
     display = (_to_display(mean_b["VV"], ok), _to_display(mean_a["VV"], ok)) if "VV" in bands else None
-    return signed, db, null_signed, null_db, np.where(ok, events, 0).astype(np.uint16), display
+    return signed, db, null_signed, null_db, np.where(ok, events, 0).astype(events.dtype), display
 
 
 def _to_display(intensity, valid):
@@ -442,7 +457,7 @@ def run(params, progress=lambda fraction, message: None, use_cache=True, plan=No
     has_null = len(plan.before) >= 2
     null_signed = np.full(shape_, stats.NODATA, np.int16) if has_null else None
     null_db = np.full(shape_, stats.NODATA, np.int16) if has_null else None
-    events = np.zeros(shape_, np.uint16)
+    events = np.zeros(shape_, events_dtype(len(plan.before) + len(plan.after)))
     dh, dw = -(-grid.height // DISPLAY_FACTOR), -(-grid.width // DISPLAY_FACTOR)
     before_db, after_db = np.zeros((dh, dw), np.uint8), np.zeros((dh, dw), np.uint8)
     tiles = grid.tiles()

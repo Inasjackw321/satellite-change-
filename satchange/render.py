@@ -105,7 +105,8 @@ def find_spots(result, detected):
     seen = np.zeros((len(passes) - 1, len(ids)), bool)
     if result.events is not None:
         for i in range(len(passes) - 1):
-            seen[i] = ndimage.mean((result.events >> i) & 1, labels, ids) >= SPOT_SHARE
+            bit = (result.events >> result.events.dtype.type(i)) & 1
+            seen[i] = ndimage.mean(bit, labels, ids) >= SPOT_SHARE
     spots = []
     for k in range(len(ids)):
         lat, lon = grid.pixel_latlon(rows[k], cols[k])

@@ -172,3 +172,46 @@ def test_range_without_images_is_explained(offline):
     params = engine.Params(**{**PARAMS.__dict__, "start": "2026-08-04", "end": "2026-08-10"})
     with pytest.raises(ValueError, match="Try a longer date range"):
         engine.make_plan(params)
+
+
+def test_lookback_grows_with_images():
+    assert engine.lookback_days(1) == engine.lookback_days(3) == 90
+    assert engine.lookback_days(20) == 270  # 20 passes even on a 12-day track
+    p = engine.Params(**{**PARAMS.__dict__, "images": 20})
+    assert p.before_window == ("2025-10-07", "2026-07-05")
+
+
+def test_history_type_fits_every_pair_of_passes():
+    assert engine.events_dtype(2) == np.uint16
+    assert engine.events_dtype(17) == np.uint16  # 16 pairs
+    assert engine.events_dtype(18) == np.uint32
+    assert engine.events_dtype(33) == np.uint32  # 32 pairs
+    assert engine.events_dtype(40) == np.uint64  # 20 + 20 images
+
+
+def test_five_images_each_side(offline):
+    params = engine.Params(**{**PARAMS.__dict__, "images": 5})
+    result = engine.run(params, signer=source.Signer())
+    assert result.before_days == ["2026-06-10", "2026-06-16", "2026-06-22", "2026-06-28", "2026-07-04"]
+    assert result.after_days == ["2026-07-10", "2026-07-16", "2026-07-22", "2026-07-28", "2026-08-03"]
+    found = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
+    patch, activity = render.find_spots(result, found)
+    assert patch.change_db < -6 and patch.when == ["4 Jul 2026 → 10 Jul 2026"]
+    assert activity.times == 3  # on 22 Jul, off 28 Jul, on 3 Aug
+    assert render.summarize(result, render.PRESETS["Balanced"]).noise_km2 == 0
+
+
+def test_asking_for_more_images_than_exist_uses_what_there_is(offline):
+    params = engine.Params(**{**PARAMS.__dict__, "images": 20})
+    plan = engine.make_plan(params)
+    assert len(plan.before) == 7 and len(plan.after) == 5  # all there is in the test archive
+    result = engine.run(params, plan=plan, signer=source.Signer())
+    assert len(result.passes) == 12 and result.events.dtype == np.uint16
+
+
+def test_spot_history_works_with_wide_history_types(result):
+    found = render.detect(result.signed, result.change_db, render.PRESETS["Balanced"], 2)
+    narrow = render.find_spots(result, found)
+    result.events = result.events.astype(np.uint64)
+    wide = render.find_spots(result, found)
+    assert [(s.times, s.when) for s in wide] == [(s.times, s.when) for s in narrow]

@@ -37,9 +37,12 @@ In the sidebar:
    4 August 2026. The app uses the latest images up to the start date as
    "before", and the latest images up to the end date (after the start) as
    "after".
-3. **Images to average on each side:** the default is 3. More images remove
-   more noise but mean a bigger download and reach further back from each
-   date.
+3. **Images on each side:** from **1** (compare just one image before with one
+   image after) up to **20**; the default is 3. More images average out more
+   noise, so smaller changes can be found, but mean a bigger download and reach
+   further back from each date (for 20 images, up to about 9 months before the
+   start). If fewer images exist than you ask for, the sidebar says so and the
+   app uses what there is.
 
 Before anything is downloaded, the sidebar lists the exact image dates it
 found and roughly how much it will download. It warns if the nearest image is
@@ -78,8 +81,8 @@ changed spot (CSV: location, size, change in dB, times changed, dates).
 provides Sentinel-1 images free and anonymously, radiometrically terrain
 corrected, as cloud-optimised GeoTIFFs. The app downloads only the pixels
 covering your area. As a guide, the Irpin/Bucha/Hostomel area (~300 km²) with 3
-images on each side is about 100 MB; the whole of Kyiv (~2,300 km²) is nearly
-1 GB.
+images on each side is about 100 MB, with 20 on each side about 700 MB; the
+whole of Kyiv (~2,300 km²) with 3 on each side is nearly 1 GB.
 Images: contains modified Copernicus Sentinel data.
 
 ## Reading the map

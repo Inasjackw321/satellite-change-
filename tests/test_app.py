@@ -227,3 +227,16 @@ def test_download_box_makes_a_watermarked_image(app):
     # Changing a setting asks for a new image.
     app.text_input(key="export_watermark").set_value("@someone").run()
     assert any("press **Create image** again" in c.value for c in app.caption)
+
+
+def test_images_on_each_side_from_1_to_20(app):
+    app.run()
+    slider = app.sidebar.slider[0]
+    assert slider.label == "Images on each side" and (slider.min, slider.max) == (1, 20)
+    set_dates(app)
+    slider.set_value(1).run()
+    info = " ".join(i.value for i in app.sidebar.info)
+    assert "**Before:** 4 Jul 2026" in info and "**After:** 3 Aug 2026" in info
+    app.sidebar.slider[0].set_value(20).run()
+    assert any("Only 5 images between the start and end dates (you asked for 20)" in w.value
+               for w in app.sidebar.warning)

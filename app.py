@@ -200,10 +200,11 @@ with st.sidebar:
     end = c2.date_input("End", latest, format="DD/MM/YYYY", key="end")
     st.caption("Compares the latest images up to the start date with the latest images up to "
                "the end date.")
-    images = st.select_slider(
-        "Images to average on each side", [1, 2, 3, 4, 6], value=3,
-        help="Averaging several images removes more noise, so smaller changes can be found. "
-             "More images mean a bigger download and reach further back from each date.")
+    images = st.slider(
+        "Images on each side", 1, engine.MAX_IMAGES, 3,
+        help="1 compares just one image before with one image after. Averaging more images "
+             "removes more noise, so smaller changes can be found, but means a bigger download "
+             "and reaches further back from each date.")
 
     with st.expander("Advanced settings"):
         smooth = SMOOTHING[st.selectbox(
@@ -253,6 +254,12 @@ with st.sidebar:
         gaps = [(start - max(plan.before)).days, (end - max(plan.after)).days]
         if max(gaps) > 14:
             st.warning(f"The nearest images are up to {max(gaps)} days before your dates.")
+        if len(plan.after) < images:
+            st.warning(f"Only {len(plan.after)} image{'s' if len(plan.after) != 1 else ''} between the "
+                       f"start and end dates (you asked for {images}). Move the end date later for more.")
+        elif len(plan.before) < images:
+            st.warning(f"Only {len(plan.before)} images found before the start date "
+                       f"(you asked for {images}).")
         if plan.download_mb > BIG_DOWNLOAD_MB:
             st.warning("That's a big download. A smaller area or fewer images is faster.")
 
